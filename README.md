@@ -88,7 +88,19 @@ and wraps each span in the model's marker tokens.
 
 ### Audio: speech the model hears, music it doesn't
 
-Gemma's audio tower is a **speech (ASR) encoder** — it transcribes spoken words
+**Which Gemma 4 model can do audio at all?** There are two audio paths, and only one is
+reliable:
+
+| model | audio path | what it does |
+|-------|-----------|--------------|
+| **12B** | unified `gemma4ua` | **real speech ASR** — transcribes spoken words accurately; but **speech-only** (deaf to music/ambient — it confabulates on them). |
+| **E4B** | legacy `gemma4a` conformer | **confabulates** — fluent output that tracks the *prompt*, not the audio; verbatim ASR fails. A model-capability limit (reproduced on llama.cpp mainline and the fork too — not a runner bug), so little-gemma's runner doesn't wire it up: E2B/E4B audio frames **error**. |
+| **E2B** | legacy `gemma4a` conformer | same as E4B, weaker. |
+
+So for in-model audio use the **12B**; for E2B/E4B the production path is Whisper for
+speech-to-text. Everything below is about the 12B's tower.
+
+The 12B's audio tower is a **speech (ASR) encoder** — it transcribes spoken words
 well, but it is *deaf to music and ambient sound*: fed those it confabulates (asked
 to "describe the drums" over a solo-piano clip, it confidently invents heavy-metal
 drums). So mmcat treats audio in a **hybrid** way once you give it a whisper model
@@ -118,6 +130,34 @@ system prompt declaring it can perceive provided audio; that's little-gemma's si
 
 Combined video+audio in one turn (frames then soundtrack) is fine — the model fuses
 the visuals with the speech; use `-na`/`-nv` only if you want to drop one stream.
+
+### Enabling whisper (optional)
+
+The captioning needs [whisper.cpp](https://github.com/ggerganov/whisper.cpp)'s
+`whisper-cli` plus a model file — neither ships here (whisper is a dependency, kept out
+like ffmpeg). One-time setup:
+
+```sh
+git clone https://github.com/ggerganov/whisper.cpp
+cd whisper.cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j   # -> build/bin/whisper-cli
+sh ./models/download-ggml-model.sh base.en                            # -> models/ggml-base.en.bin
+```
+
+Then point mmcat at both — env vars (handy in a launch script) or per-run flags:
+
+```sh
+export LG_WHISPER_BIN=~/whisper.cpp/build/bin/whisper-cli
+export LG_WHISPER_MODEL=~/whisper.cpp/models/ggml-base.en.bin
+mmcat /tmp/lg.sock clip.mp4 "Describe the scene and the background audio."
+# or, no env: mmcat --whisper-bin … --whisper-model … /tmp/lg.sock clip.mp4 "…"
+```
+
+`base`/`base.en` is plenty: mmcat uses whisper only to tell speech from non-speech and to
+grab the non-speech tag — it never replaces Gemma's own speech transcription. Use the
+multilingual `base` (not `base.en`) if the audio may not be English; a larger model gives
+finer tags (`soft piano music` vs `[MUSIC PLAYING]`) at more latency. No model set →
+whisper is skipped and raw audio is sent as before; `-nw` disables it for one run.
 
 ## Build
 ```sh

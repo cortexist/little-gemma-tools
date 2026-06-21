@@ -32,4 +32,12 @@
 #define LG_FRAME   640     // samples per audio frame (40 ms @ 16 kHz)
 #define LG_MAX_TOK 280     // default per-image vision-token budget (a Gemma 4 rung)
 
+// Per-turn span cap the runner enforces (must match run.c MAX_SEG). EVERY frame
+// is one span — including the 'T' timestamp a tool sends before each video frame,
+// so a video frame costs TWO spans (timestamp + image) and audio costs one. A
+// tool must fit within this (subsample frames, etc.); longer media is split
+// across turns by the application. (Future: the runner advertises this on connect
+// so clients need not hardcode it.)
+#define LG_MAX_SEG 256
+
 #endif

@@ -17,15 +17,32 @@
 // It throttles to fit; making long video / live streams span multiple turns is the
 // application's job (stitched as one conversation via skills).
 //
-// Flags: -nv/--no-video, -na/--no-audio, --fps N (default 1), -n BUDGET (tokens/frame).
+// Flags: -nv/--no-video, -na/--no-audio, --fps N (default 1), -n BUDGET (tokens/frame),
+//        --whisper-model FILE (enable non-speech captions; see below),
+//        --pre TEXT (a preamble before the frames — e.g. metadata a skill wants the model to see),
+//        --no-meta (suppress the auto " downsampled video" tag mmcat prepends to video).
 //
-// v1 shells out to the ffmpeg/ffprobe CLI over pipes (no temp files). The planned
+// For VIDEO, mmcat auto-prepends a ~4-token " downsampled video" tag so the model frames the
+// input as a (downsampled) video rather than disconnected stills — Gemma only ever sees sampled
+// frames, so this is honest, not a trick. Suppressed by --no-meta or by giving your own --pre.
+//
+// AUDIO is hybrid. Gemma's audio tower is a SPEECH (ASR) encoder: it transcribes spoken
+// words, but it is DEAF to music/ambient sound — fed those, it confabulates (describes
+// whatever instrument the prompt names). So when --whisper-model is set, mmcat runs
+// whisper (which DOES tag non-speech, e.g. "[MUSIC PLAYING]") and: for a clip with
+// speech, still sends the raw audio (the model's own ears) plus a caption for any music
+// under it; for a pure non-speech clip, sends ONLY the caption (no audio embedding — it
+// would just make the model hallucinate). With no whisper model it sends raw audio as before.
+//
+// v1 shells out to the ffmpeg/ffprobe/whisper-cli CLIs over pipes — no temp files for
+// media; whisper needs a small temp wav (whisper-cli can't read stdin). The planned
 // upgrade links libavformat/libavcodec to demux+decode in-process — see README.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <ctype.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -57,8 +74,15 @@ static int sock_init(void) { signal(SIGPIPE, SIG_IGN); return 0; }
 static int g_budget = LG_MAX_TOK, g_budget_set = 0;
 static double g_fps = 1.0;
 static int g_no_video = 0, g_no_audio = 0;
+static int g_no_whisper = 0;
+static const char *g_whisper_bin = NULL;     // whisper-cli to shell to (default: "whisper-cli" on PATH)
+static const char *g_whisper_model = NULL;   // setting a model (flag or LG_WHISPER_MODEL) turns captions ON
+static char g_audio_note[1024] = "";         // non-speech captions, fused onto the question (not a span)
+static const char *g_pre = NULL;             // optional preamble text, sent as a span BEFORE the frames (--pre)
+static int g_no_meta = 0;                     // auto " downsampled video" tag before video frames (on unless --no-meta / --pre)
 static int g_segs = 0;                       // spans sent this turn; must stay <= LG_MAX_SEG
 static int room_for(int n) { return g_segs + n <= LG_MAX_SEG; }
+static int whisper_on(void) { return g_whisper_model && *g_whisper_model && !g_no_whisper; }
 
 // ---- geometry: resized (W,H), each side a PATCH multiple, <= budget patches,
 //      aspect preserved. Byte-identical to the runner's media_cat target_size. ----
@@ -173,13 +197,13 @@ static int send_visual(sock_t s, const char *path, int vw, int vh, int is_video,
     return rc;
 }
 
-static int send_audio(sock_t s, const char *path) {
-    if (!room_for(1)) { fprintf(stderr, "mmcat: no span left in this turn for %s audio — skipped\n", path); return 0; }
+// decode any audio file -> padded mono 16 kHz s16 PCM (caller frees *pcm_out).
+static int decode_audio(const char *path, int16_t **pcm_out, size_t *nsamp_out) {
     char cmd[4096];
     snprintf(cmd, sizeof cmd, "ffmpeg -v error -i \"%s\" -ac 1 -ar %d -f s16le -", path, LG_RATE);
     FILE *f = run_pipe(cmd);
     if (!f) { fprintf(stderr, "mmcat: ffmpeg audio decode failed for %s\n", path); return -1; }
-    size_t cap = 1 << 20, n = 0; int16_t *pcm = malloc(cap * 2); size_t k;
+    size_t cap = 1 << 20, n = 0, k; int16_t *pcm = malloc(cap * 2);
     if (!pcm) { pclose(f); return -1; }
     int16_t chunk[4096];
     while ((k = fread(chunk, 2, 4096, f)) > 0) {
@@ -188,11 +212,110 @@ static int send_audio(sock_t s, const char *path) {
     }
     pclose(f);
     size_t npad = (n + LG_FRAME - 1) / LG_FRAME * LG_FRAME;   // whole frames; runner never sees a tail
-    if (npad > n) { int16_t *t = realloc(pcm, npad * 2); if (t) { pcm = t; memset(pcm + n, 0, (npad - n) * 2); } }
+    if (npad > n) { int16_t *t = realloc(pcm, npad * 2); if (t) { pcm = t; memset(pcm + n, 0, (npad - n) * 2); } else npad = n; }
+    *pcm_out = pcm; *nsamp_out = npad;
+    return 0;
+}
+
+static int send_audio_frame(sock_t s, const char *path, const int16_t *pcm, size_t npad) {
     int rc = send_frame(s, LG_FRAME_AUDIO, 0, 0, pcm, (uint32_t)(2 * npad));
     fprintf(stderr, "mmcat: %s -> %.2fs audio (%zu tok)\n", path, npad / (double)LG_RATE, npad / LG_FRAME);
-    free(pcm);
     return rc;
+}
+
+// ---- whisper: caption the non-speech audio Gemma is deaf to --------------------
+// Gemma's audio tower transcribes SPEECH but cannot perceive music/ambient (it
+// confabulates on them). whisper DOES tag non-speech ("[MUSIC PLAYING]", "(soft
+// piano music)"), so we run it and inject the tag as a text caption — speech still
+// goes through the model's own ears; whisper only fills the gap.
+static int tag_is_noise(const char *s) {   // whisper's "no useful content" markers
+    char low[64]; size_t n = 0;
+    for (size_t i = 0; s[i] && n < sizeof low - 1; i++)
+        if (isalpha((unsigned char)s[i])) low[n++] = (char)tolower((unsigned char)s[i]);
+    low[n] = 0;
+    return !n || strstr(low, "blank") || strstr(low, "silence") || strstr(low, "inaudible");
+}
+
+static void temp_wav_path(char *buf, size_t n) {   // whisper-cli reads files only, not stdin
+#ifdef _WIN32
+    char dir[MAX_PATH]; DWORD d = GetTempPathA((DWORD)sizeof dir, dir);
+    if (!d || d > sizeof dir) strcpy(dir, ".\\");
+    snprintf(buf, n, "%smmcat_w_%lu.wav", dir, (unsigned long)GetCurrentProcessId());
+#else
+    const char *t = getenv("TMPDIR"); if (!t || !*t) t = "/tmp";
+    snprintf(buf, n, "%s/mmcat_w_%ld.wav", t, (long)getpid());
+#endif
+}
+
+static int write_wav(const char *path, const int16_t *pcm, size_t nsamp) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    uint32_t datalen = (uint32_t)(nsamp * 2), srate = LG_RATE, byterate = srate * 2, riff = 36 + datalen, fmtlen = 16;
+    uint16_t fmt = 1, ch = 1, ba = 2, bps = 16;
+    uint8_t h[44];
+    memcpy(h, "RIFF", 4);      memcpy(h + 4, &riff, 4);   memcpy(h + 8, "WAVE", 4);
+    memcpy(h + 12, "fmt ", 4); memcpy(h + 16, &fmtlen, 4);
+    memcpy(h + 20, &fmt, 2);   memcpy(h + 22, &ch, 2);    memcpy(h + 24, &srate, 4);
+    memcpy(h + 28, &byterate, 4); memcpy(h + 32, &ba, 2); memcpy(h + 34, &bps, 2);
+    memcpy(h + 36, "data", 4); memcpy(h + 40, &datalen, 4);
+    int ok = fwrite(h, 1, 44, f) == 44 && fwrite(pcm, 2, nsamp, f) == nsamp;
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+// run whisper on the PCM; collect non-speech tags into `tags`, set *has_speech when
+// real words remain. Returns 0 on success, -1 if whisper is missing/failed.
+static int whisper_caption(const int16_t *pcm, size_t nsamp, char *tags, size_t gcap, int *has_speech) {
+    *has_speech = 0; if (gcap) tags[0] = 0;
+    char wav[1024]; temp_wav_path(wav, sizeof wav);
+    if (write_wav(wav, pcm, nsamp) != 0) return -1;
+    const char *bin = g_whisper_bin ? g_whisper_bin : "whisper-cli";
+    char cmd[8192];
+    snprintf(cmd, sizeof cmd, "\"%s\" -m \"%s\" -f \"%s\" -nt -np 2>%s", bin, g_whisper_model, wav,
+#ifdef _WIN32
+             "NUL"
+#else
+             "/dev/null"
+#endif
+             );
+    FILE *f = run_pipe(cmd);
+    if (!f) { remove(wav); return -1; }
+    char out[8192]; size_t n = fread(out, 1, sizeof out - 1, f); out[n] = 0;
+    int rc = pclose(f);
+    remove(wav);
+    if (n == 0 && rc != 0) return -1;   // command-not-found / failure -> caller falls back to native
+    size_t g = 0; int speech = 0;       // split bracketed/parenthesized groups (tags) from bare words (speech)
+    for (size_t i = 0; out[i]; ) {
+        char c = out[i];
+        if (c == '[' || c == '(') {
+            char close = c == '[' ? ']' : ')', tag[256]; size_t j = i + 1, t = 0;
+            while (out[j] && out[j] != close && t < sizeof tag - 1) tag[t++] = out[j++];
+            tag[t] = 0; if (out[j]) j++; i = j;
+            if (!tag_is_noise(tag)) {
+                if (g && g + 3 < gcap) { memcpy(tags + g, " | ", 3); g += 3; }
+                for (size_t k = 0; tag[k] && g + 1 < gcap; k++) tags[g++] = tag[k];
+                if (g < gcap) tags[g] = 0;
+            }
+        } else { if (isalnum((unsigned char)c)) speech = 1; i++; }
+    }
+    *has_speech = speech;
+    return 0;
+}
+
+// Two things make a non-speech caption actually land, both proven the hard way:
+//  (1) frame it as a "transcript" — the model trusts an audio transcript as provided
+//      ground truth and relays it, even against a yes/no "can you hear?"; a bare
+//      "(background audio: ...)" reads like a claim it should verify by hearing and
+//      its "I'm a text AI, I can't hear" prior dismisses it.
+//  (2) FUSE it onto the question, not a separate span — as its own media span the
+//      model treats "can you hear anything" as a standalone capability question and
+//      denies, ignoring the span; in one text blob with the question it relays it.
+static void note_caption(const char *tag) {
+    char low[256]; size_t i = 0;
+    for (; tag[i] && i < sizeof low - 1; i++) low[i] = (char)tolower((unsigned char)tag[i]);
+    low[i] = 0;
+    size_t n = strlen(g_audio_note);
+    snprintf(g_audio_note + n, sizeof g_audio_note - n, "Audio transcript of the provided clip: [%s]. ", low);
 }
 
 static int process_file(sock_t s, const char *path) {
@@ -204,10 +327,14 @@ static int process_file(sock_t s, const char *path) {
     if (p.has_video && !g_no_video) {
         int budget = (is_video && !g_budget_set) ? VIDEO_TOK : g_budget;   // auto-low for video
         double fps = g_fps;
+        if (is_video && !g_pre && !g_no_meta) {        // ~4-token honest tag: model frames it as (downsampled) video, not stills
+            static const char meta[] = " downsampled video\n";
+            send_frame(s, LG_FRAME_TEXT, 0, 0, meta, (uint32_t)(sizeof meta - 1));
+        }
         if (is_video) {
             // adapt: leave a span for audio if it's coming, then subsample frames
             // (2 spans each) uniformly across the whole clip to fit what's left.
-            int reserve = (p.has_audio && !g_no_audio) ? 1 : 0;
+            int reserve = (p.has_audio && !g_no_audio) ? 1 : 0;   // the audio embedding span (captions fuse onto the question)
             int max_frames = (LG_MAX_SEG - g_segs - reserve) / 2;
             if (max_frames < 1) max_frames = 1;
             int n_req = (int)(p.duration * fps + 0.5);
@@ -220,17 +347,43 @@ static int process_file(sock_t s, const char *path) {
         }
         if (send_visual(s, path, p.vw ? p.vw : LG_PATCH, p.vh ? p.vh : LG_PATCH, is_video, fps, budget) != 0) return -1;
     }
-    if (p.has_audio && !g_no_audio && send_audio(s, path) != 0) return -1;
+    if (p.has_audio && !g_no_audio) {
+        int16_t *pcm = NULL; size_t npad = 0;
+        if (decode_audio(path, &pcm, &npad) != 0) return -1;
+        char tags[1024] = ""; int has_speech = 1;   // whisper off -> hand the model the audio as before
+        if (whisper_on() && whisper_caption(pcm, npad, tags, sizeof tags, &has_speech) == 0) {
+            if (has_speech) {                                  // speech: native ears, note any music under it
+                if (room_for(1)) send_audio_frame(s, path, pcm, npad);
+                if (tags[0]) { note_caption(tags); fprintf(stderr, "mmcat: %s -> speech + background [%s]\n", path, tags); }
+            } else if (tags[0]) {                              // non-speech only: caption, no embedding (model can't hear music)
+                note_caption(tags);
+                fprintf(stderr, "mmcat: %s -> non-speech, captioned as transcript [%s]; no embedding\n", path, tags);
+            } else {
+                fprintf(stderr, "mmcat: %s -> audio silent/blank, skipped\n", path);
+            }
+        } else if (room_for(1)) {
+            send_audio_frame(s, path, pcm, npad);              // whisper off/unavailable: send audio as before
+        }
+        free(pcm);
+    }
     return 0;
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-            "usage: %s <socket> [-nv|--no-video] [-na|--no-audio] [--fps N] [-n budget] file... [\"question\"]\n"
+            "usage: %s <socket> [-nv|--no-video] [-na|--no-audio] [--fps N] [-n budget]\n"
+            "             [--whisper-model FILE] [--whisper-bin PATH] [-nw|--no-whisper] file... [\"question\"]\n"
             "  modality is auto-detected per file (ffprobe); no -i/-a switches.\n"
-            "  --fps  video frame sample rate (default 1; auto-reduced to fit the turn span cap)\n"
-            "  -n     vision tokens per frame (default %d; video auto-defaults to %d)\n",
+            "  --fps           video frame sample rate (default 1; auto-reduced to fit the turn span cap)\n"
+            "  -n              vision tokens per frame (default %d; video auto-defaults to %d)\n"
+            "  --whisper-model whisper.cpp model file; ENABLES non-speech captions (or set LG_WHISPER_MODEL).\n"
+            "                  Gemma's ears are speech-only; whisper captions music/ambient so the model knows.\n"
+            "  --whisper-bin   whisper-cli to run (default: whisper-cli on PATH; or LG_WHISPER_BIN)\n"
+            "  -nw             disable whisper even if a model is configured\n"
+            "  --pre TEXT      preamble text sent BEFORE the frames in the turn (e.g. metadata:\n"
+            "                  format/fps/sample-rate/file-vs-stream); a skill builds it, mmcat just carries it\n"
+            "  --no-meta       suppress the automatic ' downsampled video' tag mmcat adds before video frames\n",
             argv[0], LG_MAX_TOK, VIDEO_TOK);
         return 1;
     }
@@ -241,9 +394,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-na") || !strcmp(argv[i], "--no-audio")) g_no_audio = 1;
         else if (!strcmp(argv[i], "--fps") && i + 1 < argc) { g_fps = atof(argv[++i]); if (g_fps <= 0) g_fps = 1.0; }
         else if (!strcmp(argv[i], "-n") && i + 1 < argc)    { g_budget = atoi(argv[++i]); if (g_budget < 1) g_budget = 1; g_budget_set = 1; }
+        else if (!strcmp(argv[i], "-nw") || !strcmp(argv[i], "--no-whisper")) g_no_whisper = 1;
+        else if (!strcmp(argv[i], "--whisper-model") && i + 1 < argc) g_whisper_model = argv[++i];
+        else if (!strcmp(argv[i], "--whisper-bin") && i + 1 < argc)   g_whisper_bin = argv[++i];
+        else if (!strcmp(argv[i], "--pre") && i + 1 < argc)           g_pre = argv[++i];
+        else if (!strcmp(argv[i], "--no-meta"))                       g_no_meta = 1;
         else if (file_ok(argv[i])) { if (nf < 256) files[nf++] = argv[i]; }
         else question = argv[i];   // last non-file arg is the turn's text
     }
+    if (!g_whisper_model) g_whisper_model = getenv("LG_WHISPER_MODEL");
+    if (!g_whisper_bin)   g_whisper_bin   = getenv("LG_WHISPER_BIN");
     if (!nf && !question) { fprintf(stderr, "mmcat: no files and no question given\n"); return 1; }
 
     struct sockaddr_un sa; memset(&sa, 0, sizeof sa); sa.sun_family = AF_UNIX;
@@ -253,10 +413,15 @@ int main(int argc, char **argv) {
     if (s == INVALID_SOCKET || connect(s, (struct sockaddr *)&sa, sizeof sa) != 0) {
         fprintf(stderr, "mmcat: connect to %s failed\n", spath); return 1;
     }
+    if (g_pre && *g_pre) {                                  // preamble before the media (e.g. metadata: format/fps/rate/file-or-stream)
+        char pre[4096];
+        snprintf(pre, sizeof pre, "%s\n", g_pre);
+        send_frame(s, LG_FRAME_TEXT, 0, 0, pre, (uint32_t)strlen(pre));
+    }
     for (int i = 0; i < nf; i++) if (process_file(s, files[i]) != 0) { sock_close(s); return 1; }
 
-    char line[8192];
-    snprintf(line, sizeof line, "%s\n", question ? question : "");
+    char line[8192];   // fuse any non-speech transcript note in front of the question
+    snprintf(line, sizeof line, "%s%s\n", g_audio_note, question ? question : "");
     if (send_all(s, line, strlen(line)) != 0) { fprintf(stderr, "mmcat: send failed\n"); sock_close(s); return 1; }
     shutdown(s, SHUT_WR);
 

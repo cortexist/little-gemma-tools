@@ -48,7 +48,7 @@ frames) rather than disconnected stills. It's honest, not a trick, and cheap; su
 ### Example
 ```sh
 # runner (in the little-gemma repo)
-run-cuda-i8r -m model.gguf -mm mmproj-F16.gguf -s /tmp/lg.sock
+run-cuda-i8 -m model.gguf -mm mmproj-F16.gguf -s /tmp/lg.sock
 
 # describe an mp4 with its soundtrack — one argument, auto video+audio
 mmcat /tmp/lg.sock clip.mp4 "What happens in this video and what is said?"

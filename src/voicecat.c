@@ -34,6 +34,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <ctype.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -129,43 +130,86 @@ static int write_wav(const char *path, const int16_t *pcm, size_t nsamp) {
     return ok ? 0 : -1;
 }
 
-// Transcribe: whisper's plain text minus bracketed tags, whitespace-normalized.
-// Returns 0 with the words in `out`, -1 if whisper is missing/failed.
-static int whisper_words(const int16_t *pcm, size_t nsamp, char *out, size_t cap) {
+// One whisper pass over the audio window, WITH segment timestamps and prior-
+// text context. The timestamps are what make streaming real: a segment whose
+// words are all confirmed can be TRIMMED from the window afterwards, so pass
+// cost tracks the unconfirmed tail, not the whole utterance — and `prompt`
+// (the trimmed text) keeps whisper's continuation coherent across the cut.
+// whisper-cli's default output is one "[hh:mm:ss.mmm --> hh:mm:ss.mmm] text"
+// line per segment; output without headers falls back to one whole-window
+// segment. Collects tag-stripped, space-normalized words in `out`, plus per
+// segment its end (samples) and the CUMULATIVE word count.
+#define WSEG_MAX 64
+struct wseg { size_t end_samp; int words; };
+static size_t parse_ts(const char *p) {                  // "hh:mm:ss.mmm" -> samples
+    int h = 0, m = 0; double sec = 0;
+    if (sscanf(p, "%d:%d:%lf", &h, &m, &sec) != 3) return 0;
+    return (size_t)(((h * 60 + m) * 60 + sec) * LG_RATE);
+}
+static int whisper_pass(const int16_t *pcm, size_t nsamp, const char *prompt,
+                        char *out, size_t cap, struct wseg *segs, int *nseg) {
     if (cap) out[0] = 0;
+    *nseg = 0;
     char wav[1024]; temp_wav_path(wav, sizeof wav);
     if (write_wav(wav, pcm, nsamp) != 0) { fprintf(stderr, "voicecat: temp wav write failed (%s)\n", wav); return -1; }
     const char *bin = g_whisper_bin ? g_whisper_bin : "whisper-cli";
+    char parg[512] = "";
+    if (prompt && *prompt) {
+        size_t k = 0;
+        for (const char *p = prompt; *p && k < sizeof parg - 32; p++)
+            if (*p != '"' && *p != '\\' && *p != '`' && *p != '$') parg[k++] = *p;
+        parg[k] = 0;
+    }
     char cmd[4096];
     // the extra outer quotes are for cmd.exe: a /c string that STARTS with a
     // quote gets its first and last quote stripped, mangling every path inside
     snprintf(cmd, sizeof cmd,
 #ifdef _WIN32
-             "\"\"%s\" -m \"%s\" -f \"%s\" -nt -np 2>NUL\"",
+             "\"\"%s\" -m \"%s\" -f \"%s\" -np --prompt \"%s\" 2>NUL\"",
 #else
-             "\"%s\" -m \"%s\" -f \"%s\" -nt -np 2>/dev/null",
+             "\"%s\" -m \"%s\" -f \"%s\" -np --prompt \"%s\" 2>/dev/null",
 #endif
-             bin, g_whisper_model, wav);
+             bin, g_whisper_model, wav, parg);
     FILE *f = run_pipe(cmd);
     if (!f) { remove(wav); fprintf(stderr, "voicecat: whisper spawn failed\n"); return -1; }
-    char raw[8192]; size_t n = fread(raw, 1, sizeof raw - 1, f); raw[n] = 0;
+    char raw[16384]; size_t n = fread(raw, 1, sizeof raw - 1, f); raw[n] = 0;
     int rc = pclose(f);
     remove(wav);
     if (n == 0 && rc != 0) { fprintf(stderr, "voicecat: whisper failed (rc %d) — is it on PATH?\n", rc); return -1; }
-    size_t w = 0;
-    for (size_t i = 0; raw[i]; ) {                       // strip [..] (..) groups, keep the words
-        char c = raw[i];
-        if (c == '[' || c == '(') {
-            char close = c == '[' ? ']' : ')';
-            while (raw[i] && raw[i] != close) i++;
-            if (raw[i]) i++;
-            continue;
+
+    size_t w = 0; int words = 0;
+    char *line = raw;
+    while (line && *line) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        char *text = line;
+        size_t seg_end = 0;
+        char *arrow = strstr(line, "-->");
+        if (line[0] == '[' && arrow) {                   // "[t0 --> t1]  text"
+            seg_end = parse_ts(arrow + 3 + strspn(arrow + 3, " "));
+            char *close = strchr(arrow, ']');
+            text = close ? close + 1 : arrow + 3;
         }
-        char cc = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
-        if (!(cc == ' ' && (w == 0 || out[w - 1] == ' ')) && w + 1 < cap) { out[w++] = cc; out[w] = 0; }
-        i++;
+        for (size_t i = 0; text[i]; ) {                  // strip [..] (..) tags, keep words
+            char c = text[i];
+            if (c == '[' || c == '(') {
+                char close = c == '[' ? ']' : ')';
+                while (text[i] && text[i] != close) i++;
+                if (text[i]) i++;
+                continue;
+            }
+            char cc = (c == '\r' || c == '\t') ? ' ' : c;
+            if (cc == ' ' && (w == 0 || out[w - 1] == ' ')) { i++; continue; }
+            if (w + 1 < cap) { out[w++] = cc; out[w] = 0; }
+            if (cc == ' ') words++;                      // completed a word
+            i++;
+        }
+        if (w && out[w - 1] != ' ' && w + 1 < cap) { out[w++] = ' '; out[w] = 0; words++; }
+        if (seg_end && *nseg < WSEG_MAX) { segs[*nseg].end_samp = seg_end; segs[*nseg].words = words; (*nseg)++; }
+        line = nl ? nl + 1 : NULL;
     }
     while (w && out[w - 1] == ' ') out[--w] = 0;
+    if (*nseg == 0 && w) { segs[0].end_samp = nsamp; segs[0].words = words; *nseg = 1; }
     return 0;
 }
 
@@ -275,19 +319,33 @@ int main(int argc, char **argv) {
 
     int16_t frame[FR_SAMP], ring[PREROLL * FR_SAMP];
     int ring_n = 0;                                  // valid ticks in the preroll ring (rolls)
-    int16_t *ub = NULL; size_t ub_cap = 0, ub_n = 0; // the growing utterance
-    char prev[8192] = "", cur[8192];                 // last two whisper passes
-    int committed = 0;                               // words already sent as 'T'
+    int16_t *ub = NULL; size_t ub_cap = 0, ub_n = 0; // the audio window (trimmed as words confirm)
+    char prev[8192] = "", cur[8192];                 // last two whisper passes over the window
+    struct wseg segs[WSEG_MAX]; int nseg = 0;
+    int committed = 0;                               // words sent as 'T' this utterance
+    int trimmed = 0;                                 // of those, words whose audio left the window
+    char ptail[400] = "";                            // trimmed text tail -> whisper --prompt
     size_t last_pass = 0;                            // ub_n at the previous whisper pass
     int in_utt = 0, onset = 0, sil_ms = 0, turn_open = 0, barged = 0;
     int pending = 0, barge_armed = 1, tstate = 0;    // replies awaited; one barge per utterance
     char rbuf[4096];
+    double rt0 = 0; long rtn = 0;                    // --rt deadline pacing
 
     fprintf(stderr, "voicecat: %s, listening\n", whisper ? "streaming transcripts" : "native audio spans");
     for (;;) {
         size_t got = fread(frame, 2, FR_SAMP, src);
         int eof = got < FR_SAMP;
-        if (g_rt && !eof) msleep(FR_MS);
+        if (g_rt && !eof) {
+            // pace to the frame's DEADLINE, not a flat sleep: a live mic keeps
+            // capturing while a whisper pass runs and the loop catches up from
+            // the buffer — this models that, so passes overlap "capture"
+            struct timespec ts; timespec_get(&ts, TIME_UTC);
+            double now = (double)ts.tv_sec + 1e-9 * ts.tv_nsec;
+            if (!rt0) rt0 = now;
+            rtn++;
+            double target = rt0 + rtn * (FR_MS / 1000.0);
+            if (target > now) msleep((int)((target - now) * 1000) + 1);
+        }
         // drain any reply bytes; each completed turn drops `pending`
         for (;;) {
             int k = (int)recv(s, rbuf, sizeof rbuf, 0);
@@ -321,19 +379,23 @@ int main(int argc, char **argv) {
                     memcpy(ub, ring + (PREROLL - ring_n) * FR_SAMP, pre * 2);
                     ub_n = pre;
                     in_utt = 1; sil_ms = 0; onset = 0;
-                    committed = 0; prev[0] = 0; last_pass = 0; turn_open = 0;
+                    committed = 0; trimmed = 0; ptail[0] = 0;
+                    prev[0] = 0; last_pass = 0; turn_open = 0;
                 }
             } else {
                 if (ub_n + FR_SAMP > ub_cap) { ub_cap *= 2; ub = realloc(ub, ub_cap * 2); }
                 memcpy(ub + ub_n, frame, sizeof frame); ub_n += FR_SAMP;
                 sil_ms = voiced ? 0 : sil_ms + FR_MS;
-                // mid-utterance whisper pass: commit what two passes agree on
+                // mid-utterance whisper pass over the (trimmed) window: commit
+                // words two consecutive passes agree on, then trim the window
+                // past fully-confirmed segments — pass cost tracks the tail
                 if (whisper && ub_n - last_pass >= (size_t)g_commit_ms * (LG_RATE / 1000)) {
                     last_pass = ub_n;
-                    if (whisper_words(ub, ub_n, cur, sizeof cur) == 0) {
+                    if (whisper_pass(ub, ub_n, ptail, cur, sizeof cur, segs, &nseg) == 0) {
                         int agree = agree_words(prev, cur);
-                        if (agree > committed) {
-                            size_t a = after_word(cur, committed), b = after_word(cur, agree);
+                        int local = committed - trimmed;             // sent words still in the window
+                        if (agree > local) {
+                            size_t a = after_word(cur, local), b = after_word(cur, agree);
                             while (cur[a] == ' ') a++;
                             char piece[8192];
                             int m = snprintf(piece, sizeof piece, "%s%.*s ",
@@ -342,10 +404,34 @@ int main(int argc, char **argv) {
                             send_frame(s, LG_FRAME_TEXT, piece, (uint32_t)m);
                             if (!turn_open && barged) barged = 0;
                             turn_open = 1;
-                            fprintf(stderr, "voicecat: +%d words committed\n", agree - committed);
-                            committed = agree;
+                            fprintf(stderr, "voicecat: +%d words committed\n", agree - local);
+                            committed += agree - local;
                         }
                         strcpy(prev, cur);
+                        size_t trim = 0; int twords = 0;             // whole segments, all confirmed
+                        for (int k = 0; k < nseg; k++) {
+                            if (segs[k].words > committed - trimmed) break;
+                            trim = segs[k].end_samp; twords = segs[k].words;
+                        }
+                        if (trim > ub_n) trim = ub_n;
+                        if (ub_n - trim < (size_t)LG_RATE / 4)       // keep 0.25s of continuity
+                            trim = ub_n > (size_t)LG_RATE / 4 ? ub_n - LG_RATE / 4 : 0;
+                        if (trim > 0 && twords > 0) {
+                            size_t cut = after_word(cur, twords);    // their text -> the prompt tail
+                            size_t pl = strlen(ptail), add = cut < sizeof ptail - 1 ? cut : sizeof ptail - 1;
+                            if (pl + add >= sizeof ptail - 1) {      // keep the tail, drop the head
+                                size_t keep = sizeof ptail - 1 - add;
+                                memmove(ptail, ptail + pl - keep, keep + 1); pl = keep;
+                            }
+                            memcpy(ptail + pl, cur, add); ptail[pl + add] = 0;
+                            memmove(ub, ub + trim, (ub_n - trim) * 2);
+                            ub_n -= trim;
+                            last_pass = last_pass > trim ? last_pass - trim : 0;
+                            trimmed += twords;
+                            prev[0] = 0;                             // window moved; agreement restarts
+                            fprintf(stderr, "voicecat: window -%0.1fs (%d words confirmed away)\n",
+                                    (double)trim / LG_RATE, twords);
+                        }
                     }
                 }
             }
@@ -356,8 +442,10 @@ int main(int argc, char **argv) {
             in_utt = 0;
             if (whisper) {
                 char line[8192] = "";
-                if (whisper_words(ub, ub_n, cur, sizeof cur) == 0) {
-                    size_t a = after_word(cur, committed);
+                // the final pass runs over the TRIMMED window — the unconfirmed
+                // tail, not the whole utterance; that is the streaming win
+                if (whisper_pass(ub, ub_n, ptail, cur, sizeof cur, segs, &nseg) == 0) {
+                    size_t a = after_word(cur, committed - trimmed);
                     while (cur[a] == ' ') a++;
                     snprintf(line, sizeof line, "%s%s", !turn_open && barged ? g_barge_note : "", cur + a);
                 }

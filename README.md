@@ -22,7 +22,7 @@ mmcat <socket> [flags] file... ["question"]
 | input | becomes |
 |-------|---------|
 | still image | one image span, resized to the patch grid |
-| video (mp4/…) | timestamped frames at `--fps` **and** its soundtrack |
+| video (mp4/…) | timestamped frames at `--fps`, **and** its soundtrack as a whisper transcript (see *Video + audio together*) |
 | audio file | one audio span (mono 16 kHz) |
 | any non-file arg | the question (the turn's text) |
 
@@ -72,7 +72,7 @@ mmcat /tmp/lg.sock --pre "[input] video, 2fps, 15s, from file" --fps 2 -n 66 cli
 mmcat sends little-gemma's typed media frames (`proto/lg_media_proto.h`): raw RGB
 at patch-multiple dims for images, mono 16 kHz s16 for audio, text frames for the
 `MM:SS` video timestamps — then the question as a plain line and a half-close. It
-sends **raw decoded media**; the runner does the vision encoder / audio conformer
+sends **raw decoded media**; the runner does the vision encoding / audio projection
 and wraps each span in the model's marker tokens.
 
 - **v1 (this)** shells out to the `ffmpeg`/`ffprobe` CLI over pipes — no temp files
@@ -106,8 +106,11 @@ to "describe the drums" over a solo-piano clip, it confidently invents heavy-met
 drums). So mmcat treats audio in a **hybrid** way once you give it a whisper model
 (`--whisper-model` or `LG_WHISPER_MODEL`):
 
-- **speech** → the raw audio goes to the model (its own ears), *plus* a transcript
-  note for any music playing under it;
+- **speech, audio-only turn** → the raw audio goes to the model (its own ears), *plus*
+  a transcript note for any music playing under it;
+- **speech, video in the turn** → whisper's transcript of the words is fused onto the
+  question and **no audio span is sent** — with frames in the context the model cannot
+  hear (see the next section);
 - **non-speech only** (music/ambient) → mmcat **drops the audio embedding** (it would
   only make the model hallucinate) and fuses whisper's non-speech tag onto the question
   as `Audio transcript of the provided clip: [music playing].`
@@ -128,8 +131,25 @@ in fact transcribe. Ask it to **use** the audio instead — *"summarize what is 
 *"describe the background audio"* — and it engages. (The deepest fix is a runner `-sys`
 system prompt declaring it can perceive provided audio; that's little-gemma's side.)
 
-Combined video+audio in one turn (frames then soundtrack) is fine — the model fuses
-the visuals with the speech; use `-na`/`-nv` only if you want to drop one stream.
+### Video + audio together: the model cannot hear once it sees
+
+Measured on the 12B (greedy, every arrangement — soundtrack before, after or
+interleaved with the frames, the model card's frames→text→audio order, a framing
+tag, even *black* frames, even frames in an **earlier turn** of the session): once
+image spans share the context, native audio comprehension is gone. The audio
+confabulates into the visual narrative, or the model denies having ears outright
+("I am a text-based AI…"). Audio-only turns hear fine. Vision survives audio;
+audio does not survive vision — a capability boundary of the checkpoint, not a
+template-ordering bug.
+
+So mmcat's audio policy is **turn-scoped**: if *any* file in the turn carries
+video, the soundtrack's speech travels as a whisper transcript fused onto the
+question — never as an audio span. Without a whisper model configured, the
+soundtrack of a video is **dropped with a loud warning**, because a poisoned span
+helps nobody. Audio-only turns keep the model's own ears, unchanged. The same
+boundary is why a voice+camera application should run **all** speech through
+whisper (see voicecat below): one camera frame anywhere in the session silences
+every voice turn after it.
 
 ### Enabling whisper (optional)
 
@@ -153,20 +173,90 @@ mmcat /tmp/lg.sock clip.mp4 "Describe the scene and the background audio."
 # or, no env: mmcat --whisper-bin … --whisper-model … /tmp/lg.sock clip.mp4 "…"
 ```
 
-`base`/`base.en` is plenty: mmcat uses whisper only to tell speech from non-speech and to
-grab the non-speech tag — it never replaces Gemma's own speech transcription. Use the
-multilingual `base` (not `base.en`) if the audio may not be English; a larger model gives
-finer tags (`soft piano music` vs `[MUSIC PLAYING]`) at more latency. No model set →
-whisper is skipped and raw audio is sent as before; `-nw` disables it for one run.
+`base`/`base.en` is a good default. For audio-only turns mmcat uses whisper just to
+tell speech from non-speech and to grab the non-speech tag — Gemma's own ears do the
+transcription. For video+audio turns (and for voicecat) whisper's *words* are what the
+model gets, so a larger model buys transcript quality at more latency. Use the
+multilingual `base` (not `base.en`) if the audio may not be English. No model set →
+audio-only turns send raw audio as before; `-nw` disables whisper for one run.
+
+## voicecat — live voice turn-taking
+
+mmcat is files-in-one-turn; **voicecat is an open microphone and an endless
+conversation**. It segments speech with an energy VAD, and — this is the point —
+**streams the transcript into the turn while you are still talking**. The runner's
+turn text is appendable by design (text frames accumulate until the closing line),
+so voicecat runs whisper over the growing utterance every `--commit-ms`, and words
+that two consecutive passes agree on (LocalAgreement-2 — a confirmed prefix never
+changes) are committed immediately. By end-of-speech only the unstable tail is
+left: **the post-utterance cost is one whisper pass over the last chunk, not the
+whole clip**.
+
+```
+voicecat <socket> [--mic FFMPEG_INPUT | --stdin-pcm] [flags]
+```
+
+- `--mic SPEC` — the ffmpeg capture input (default `-f alsa -i default` on Linux;
+  e.g. `-f pulse -i default`, or `-f dshow -i audio=...` on Windows, where it is
+  required)
+- `--stdin-pcm` — mono 16 kHz s16 PCM on stdin instead of a mic; `--rt` paces it
+  live (this is also the test harness — see below)
+- `--whisper-model FILE` / `--whisper-bin PATH` — streaming-transcript mode
+  (or `LG_WHISPER_MODEL` / `LG_WHISPER_BIN`)
+- `--commit-ms N` — whisper cadence during an utterance (default 1000)
+- `--hang-ms N` — trailing silence that ends an utterance (default 700)
+- `--vad-level N` — RMS speech threshold, s16 units (default 400)
+- `--barge-note TEXT` — see barge-in below (default `"(interrupting) "`)
+
+With no whisper model, each utterance goes as **one native audio span** at
+end-of-speech instead — the model's own ears, which per the section above work
+*only while the session is vision-free*. Whisper mode is the one that composes
+with a camera.
+
+### Barge-in
+
+The mic stays open while the reply streams. If you start talking over it,
+voicecat sends the runner's one-byte `LG_BARGE` signal: the runner stops decoding
+at the next token, closes the turn on the wire with `<turn|>`, and the session —
+cut-off reply included, so the model knows what it didn't get to say — continues.
+"I was interrupted" is remembered *here*, not in the runner: the next turn's text
+opens with `--barge-note`. (Measured on the Orin: a detailed history of Rome
+barged mid-sentence, then *"(interrupting) short version please"* → a one-sentence
+summary, context intact.)
+
+Turn-taking assumes the mic doesn't hear the speakers — a headset, or echo
+cancellation upstream; an open-air mic will barge on its own TTS. Whisper must
+run faster than real time (tiny/base on a GPU), or commits fall behind capture.
+
+### Example, and testing without a mic
+
+```sh
+# runner (12B; voice+camera products want whisper mode)
+run-cuda-i8 -m gemma-4-12b.gguf -mm mmproj-F16.gguf -s /tmp/lg.sock
+
+# live conversation, streaming transcripts
+export LG_WHISPER_BIN=~/whisper.cpp/build/bin/whisper-cli
+export LG_WHISPER_MODEL=~/whisper.cpp/models/ggml-base.en.bin
+voicecat /tmp/lg.sock
+
+# no mic? feed PCM at real-time pace — the whole pipeline (VAD, commits,
+# barge-in) runs exactly as live:
+ffmpeg -i clip.wav -f s16le -ac 1 -ar 16000 - | voicecat /tmp/lg.sock --stdin-pcm --rt
+```
+
+A stub "whisper" (any script that prints text) plus `--whisper-bin` exercises the
+streaming and barge paths deterministically with no whisper installed — that is
+how voicecat was validated end-to-end.
 
 ## Build
 ```sh
 cmake -S . -B build && cmake --build build --config Release
-# -> build/mmcat (or build/Release/mmcat.exe on Windows)
+# -> build/mmcat, build/voicecat (build/Release/*.exe on Windows)
 ```
-Runtime: `ffmpeg` and `ffprobe` on `PATH`; optionally `whisper-cli` + a whisper.cpp
-model for non-speech captions (point mmcat at them with `--whisper-model` /
-`--whisper-bin` or `LG_WHISPER_MODEL` / `LG_WHISPER_BIN`).
+Runtime: `ffmpeg` and `ffprobe` on `PATH`; `whisper-cli` + a whisper.cpp model for
+mmcat's captions/soundtrack transcripts and voicecat's streaming mode (point at
+them with `--whisper-model` / `--whisper-bin` or `LG_WHISPER_MODEL` /
+`LG_WHISPER_BIN`).
 
 ## License
 MIT (see `LICENSE`), matching little-gemma.

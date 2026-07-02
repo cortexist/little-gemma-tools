@@ -27,6 +27,12 @@
 #define LG_FRAME_AUDIO 'A'
 #define LG_FRAME_TEXT  'T'
 
+// Barge-in: ONE bare byte (no header, no payload) sent while the runner is
+// streaming a reply. The runner stops decoding at the next token, closes the
+// turn with "<turn|>" on the wire, and the session (and its context, cut-off
+// reply included) continues. Sent between turns it is ignored.
+#define LG_BARGE       0x02
+
 #define LG_PATCH   48      // pixels per patch side; image dims must be multiples
 #define LG_RATE    16000   // audio sample rate (mono s16)
 #define LG_FRAME   640     // samples per audio frame (40 ms @ 16 kHz)

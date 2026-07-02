@@ -274,13 +274,15 @@ static int whisper_caption(const int16_t *pcm, size_t nsamp, char *tags, size_t 
     if (write_wav(wav, pcm, nsamp) != 0) return -1;
     const char *bin = g_whisper_bin ? g_whisper_bin : "whisper-cli";
     char cmd[8192];
-    snprintf(cmd, sizeof cmd, "\"%s\" -m \"%s\" -f \"%s\" -nt -np 2>%s", bin, g_whisper_model, wav,
+    // the extra outer quotes are for cmd.exe: a /c string that STARTS with a
+    // quote gets its first and last quote stripped, mangling every path inside
+    snprintf(cmd, sizeof cmd,
 #ifdef _WIN32
-             "NUL"
+             "\"\"%s\" -m \"%s\" -f \"%s\" -nt -np 2>NUL\"",
 #else
-             "/dev/null"
+             "\"%s\" -m \"%s\" -f \"%s\" -nt -np 2>/dev/null",
 #endif
-             );
+             bin, g_whisper_model, wav);
     FILE *f = run_pipe(cmd);
     if (!f) { remove(wav); return -1; }
     char out[8192]; size_t n = fread(out, 1, sizeof out - 1, f); out[n] = 0;

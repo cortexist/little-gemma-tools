@@ -203,7 +203,9 @@ voicecat <socket> [--mic FFMPEG_INPUT | --stdin-pcm] [flags]
   live (this is also the test harness — see below)
 - `--whisper-model FILE` / `--whisper-bin PATH` — streaming-transcript mode
   (or `LG_WHISPER_MODEL` / `LG_WHISPER_BIN`)
-- `--commit-ms N` — whisper cadence during an utterance (default 1000)
+- `--commit-ms N` — whisper cadence during an utterance (default 2500; keep it
+  ≥3× one whisper invocation or passes stack up and the loop falls behind
+  real time — whisper-cli reloads its model every pass)
 - `--hang-ms N` — trailing silence that ends an utterance (default 700)
 - `--vad-level N` — RMS speech threshold, s16 units (default 400)
 - `--barge-note TEXT` — see barge-in below (default `"(interrupting) "`)

@@ -74,7 +74,10 @@ static int  wouldblock(void) { return errno == EAGAIN || errno == EWOULDBLOCK; }
 
 static const char *g_whisper_bin = NULL, *g_whisper_model = NULL;
 static const char *g_barge_note = "(interrupting) ";
-static int g_commit_ms = 1000, g_hang_ms = 700, g_vad = 400, g_rt = 0;
+// Commit cadence must comfortably exceed one ASR invocation (~0.6s for CUDA
+// base.en via whisper-cli, process+model load included) or passes stack up
+// and the loop falls behind real time: keep commit_ms >= 3x the pass cost.
+static int g_commit_ms = 2500, g_hang_ms = 700, g_vad = 400, g_rt = 0;
 
 // ---- the wire (mmcat's idioms; the socket here is NON-BLOCKING) --------------
 static int send_all(sock_t s, const void *buf, size_t n) {
@@ -271,7 +274,7 @@ int main(int argc, char **argv) {
         fprintf(stderr,
             "usage: voicecat <socket> [--mic FFMPEG_INPUT | --stdin-pcm] [--rt]\n"
             "                [--whisper-model FILE] [--whisper-bin PATH] [--barge-note TEXT]\n"
-            "                [--commit-ms N=1000] [--hang-ms N=700] [--vad-level N=400]\n"
+            "                [--commit-ms N=2500] [--hang-ms N=700] [--vad-level N=400]\n"
             "  --mic        ffmpeg input spec (default \"-f alsa -i default\" on Linux)\n"
             "  --stdin-pcm  mono 16 kHz s16 PCM on stdin instead of a mic (--rt paces it live)\n"
             "  no whisper model -> whole utterances as native audio spans (vision-free sessions only)\n");
@@ -326,6 +329,7 @@ int main(int argc, char **argv) {
     int trimmed = 0;                                 // of those, words whose audio left the window
     char ptail[400] = "";                            // trimmed text tail -> whisper --prompt
     size_t last_pass = 0;                            // ub_n at the previous whisper pass
+    size_t last_voice = 0;                           // ub_n at the last voiced frame
     int in_utt = 0, onset = 0, sil_ms = 0, turn_open = 0, barged = 0;
     int pending = 0, barge_armed = 1, tstate = 0;    // replies awaited; one barge per utterance
     char rbuf[4096];
@@ -380,16 +384,21 @@ int main(int argc, char **argv) {
                     ub_n = pre;
                     in_utt = 1; sil_ms = 0; onset = 0;
                     committed = 0; trimmed = 0; ptail[0] = 0;
-                    prev[0] = 0; last_pass = 0; turn_open = 0;
+                    prev[0] = 0; last_pass = 0; last_voice = ub_n; turn_open = 0;
                 }
             } else {
                 if (ub_n + FR_SAMP > ub_cap) { ub_cap *= 2; ub = realloc(ub, ub_cap * 2); }
                 memcpy(ub + ub_n, frame, sizeof frame); ub_n += FR_SAMP;
                 sil_ms = voiced ? 0 : sil_ms + FR_MS;
+                if (voiced) last_voice = ub_n;
                 // mid-utterance whisper pass over the (trimmed) window: commit
                 // words two consecutive passes agree on, then trim the window
-                // past fully-confirmed segments — pass cost tracks the tail
-                if (whisper && ub_n - last_pass >= (size_t)g_commit_ms * (LG_RATE / 1000)) {
+                // past fully-confirmed segments — pass cost tracks the tail.
+                // Skipped once trailing silence accumulates: the utterance is
+                // probably ending, and with a per-invocation ASR (whisper-cli
+                // reloads its model every pass) a late mid-pass only delays
+                // the final one that supersedes it.
+                if (whisper && sil_ms < 300 && ub_n - last_pass >= (size_t)g_commit_ms * (LG_RATE / 1000)) {
                     last_pass = ub_n;
                     if (whisper_pass(ub, ub_n, ptail, cur, sizeof cur, segs, &nseg) == 0) {
                         int agree = agree_words(prev, cur);
@@ -427,6 +436,7 @@ int main(int argc, char **argv) {
                             memmove(ub, ub + trim, (ub_n - trim) * 2);
                             ub_n -= trim;
                             last_pass = last_pass > trim ? last_pass - trim : 0;
+                            last_voice = last_voice > trim ? last_voice - trim : 0;
                             trimmed += twords;
                             prev[0] = 0;                             // window moved; agreement restarts
                             fprintf(stderr, "voicecat: window -%0.1fs (%d words confirmed away)\n",
@@ -442,9 +452,14 @@ int main(int argc, char **argv) {
             in_utt = 0;
             if (whisper) {
                 char line[8192] = "";
-                // the final pass runs over the TRIMMED window — the unconfirmed
-                // tail, not the whole utterance; that is the streaming win
-                if (whisper_pass(ub, ub_n, ptail, cur, sizeof cur, segs, &nseg) == 0) {
+                // The final pass runs over the TRIMMED window — the unconfirmed
+                // tail, not the whole utterance. And when no voiced frame
+                // arrived after the last mid-pass began, that pass already
+                // heard every spoken word: reuse its transcript instead of
+                // paying a whole ASR invocation to re-transcribe silence.
+                int heard = last_pass > 0 && last_voice <= last_pass;
+                int ok = heard || whisper_pass(ub, ub_n, ptail, cur, sizeof cur, segs, &nseg) == 0;
+                if (ok) {
                     size_t a = after_word(cur, committed - trimmed);
                     while (cur[a] == ' ') a++;
                     snprintf(line, sizeof line, "%s%s", !turn_open && barged ? g_barge_note : "", cur + a);

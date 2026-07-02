@@ -77,7 +77,8 @@ static int g_no_video = 0, g_no_audio = 0;
 static int g_no_whisper = 0;
 static const char *g_whisper_bin = NULL;     // whisper-cli to shell to (default: "whisper-cli" on PATH)
 static const char *g_whisper_model = NULL;   // setting a model (flag or LG_WHISPER_MODEL) turns captions ON
-static char g_audio_note[1024] = "";         // non-speech captions, fused onto the question (not a span)
+static char g_audio_note[4096] = "";         // transcript notes, fused onto the question (not a span)
+static int g_turn_video = 0;                 // any file this turn sends frames (see the audio policy)
 static const char *g_pre = NULL;             // optional preamble text, sent as a span BEFORE the frames (--pre)
 static int g_no_meta = 0;                     // auto " downsampled video" tag before video frames (on unless --no-meta / --pre)
 static int g_segs = 0;                       // spans sent this turn; must stay <= LG_MAX_SEG
@@ -263,10 +264,12 @@ static int write_wav(const char *path, const int16_t *pcm, size_t nsamp) {
     return ok ? 0 : -1;
 }
 
-// run whisper on the PCM; collect non-speech tags into `tags`, set *has_speech when
-// real words remain. Returns 0 on success, -1 if whisper is missing/failed.
-static int whisper_caption(const int16_t *pcm, size_t nsamp, char *tags, size_t gcap, int *has_speech) {
-    *has_speech = 0; if (gcap) tags[0] = 0;
+// run whisper on the PCM; collect non-speech tags into `tags` and the spoken words
+// into `words` (whitespace-normalized), set *has_speech when real words remain.
+// Returns 0 on success, -1 if whisper is missing/failed.
+static int whisper_caption(const int16_t *pcm, size_t nsamp, char *tags, size_t gcap,
+                           char *words, size_t wcap, int *has_speech) {
+    *has_speech = 0; if (gcap) tags[0] = 0; if (wcap) words[0] = 0;
     char wav[1024]; temp_wav_path(wav, sizeof wav);
     if (write_wav(wav, pcm, nsamp) != 0) return -1;
     const char *bin = g_whisper_bin ? g_whisper_bin : "whisper-cli";
@@ -284,7 +287,7 @@ static int whisper_caption(const int16_t *pcm, size_t nsamp, char *tags, size_t 
     int rc = pclose(f);
     remove(wav);
     if (n == 0 && rc != 0) return -1;   // command-not-found / failure -> caller falls back to native
-    size_t g = 0; int speech = 0;       // split bracketed/parenthesized groups (tags) from bare words (speech)
+    size_t g = 0, w = 0; int speech = 0;   // split bracketed/parenthesized groups (tags) from bare words (speech)
     for (size_t i = 0; out[i]; ) {
         char c = out[i];
         if (c == '[' || c == '(') {
@@ -296,8 +299,15 @@ static int whisper_caption(const int16_t *pcm, size_t nsamp, char *tags, size_t 
                 for (size_t k = 0; tag[k] && g + 1 < gcap; k++) tags[g++] = tag[k];
                 if (g < gcap) tags[g] = 0;
             }
-        } else { if (isalnum((unsigned char)c)) speech = 1; i++; }
+        } else {
+            if (isalnum((unsigned char)c)) speech = 1;
+            char cc = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+            if (!(cc == ' ' && (w == 0 || words[w - 1] == ' ')) && w + 1 < wcap)
+                { words[w++] = cc; words[w] = 0; }
+            i++;
+        }
     }
+    while (w && words[w - 1] == ' ') words[--w] = 0;
     *has_speech = speech;
     return 0;
 }
@@ -318,6 +328,18 @@ static void note_caption(const char *tag) {
     snprintf(g_audio_note + n, sizeof g_audio_note - n, "Audio transcript of the provided clip: [%s]. ", low);
 }
 
+// Speech heard under video: the model cannot use its own ears once frames share
+// the context — measured 2026-07-02 on the 12B, every arrangement (audio before,
+// after, interleaved, the model card's frames/text/audio order, a framing tag,
+// even black frames or frames in an EARLIER turn): the audio confabulates into
+// the visual narrative, or the model denies hearing outright. Audio-only turns
+// hear fine. So under video the soundtrack's SPEECH rides the same transcript
+// trick as non-speech tags — whisper's words, fused onto the question.
+static void note_speech(const char *words) {
+    size_t n = strlen(g_audio_note);
+    snprintf(g_audio_note + n, sizeof g_audio_note - n, "Audio transcript of the provided clip: \"%s\". ", words);
+}
+
 static int process_file(sock_t s, const char *path) {
     struct probe p;
     if (probe_file(path, &p) != 0) return -1;
@@ -332,10 +354,10 @@ static int process_file(sock_t s, const char *path) {
             send_frame(s, LG_FRAME_TEXT, 0, 0, meta, (uint32_t)(sizeof meta - 1));
         }
         if (is_video) {
-            // adapt: leave a span for audio if it's coming, then subsample frames
-            // (2 spans each) uniformly across the whole clip to fit what's left.
-            int reserve = (p.has_audio && !g_no_audio) ? 1 : 0;   // the audio embedding span (captions fuse onto the question)
-            int max_frames = (LG_MAX_SEG - g_segs - reserve) / 2;
+            // subsample frames (2 spans each) uniformly across the whole clip to
+            // fit the turn (no span reserved for audio: with frames in the turn
+            // the soundtrack travels as a transcript note, never as a span).
+            int max_frames = (LG_MAX_SEG - g_segs) / 2;
             if (max_frames < 1) max_frames = 1;
             int n_req = (int)(p.duration * fps + 0.5);
             if (n_req > max_frames && p.duration > 0.0) {
@@ -350,19 +372,28 @@ static int process_file(sock_t s, const char *path) {
     if (p.has_audio && !g_no_audio) {
         int16_t *pcm = NULL; size_t npad = 0;
         if (decode_audio(path, &pcm, &npad) != 0) return -1;
-        char tags[1024] = ""; int has_speech = 1;   // whisper off -> hand the model the audio as before
-        if (whisper_on() && whisper_caption(pcm, npad, tags, sizeof tags, &has_speech) == 0) {
-            if (has_speech) {                                  // speech: native ears, note any music under it
+        char tags[1024] = "", words[4096] = ""; int has_speech = 1;
+        if (whisper_on() && whisper_caption(pcm, npad, tags, sizeof tags, words, sizeof words, &has_speech) == 0) {
+            if (has_speech && !g_turn_video) {                 // audio-only turn: native ears, note any music under it
                 if (room_for(1)) send_audio_frame(s, path, pcm, npad);
                 if (tags[0]) { note_caption(tags); fprintf(stderr, "mmcat: %s -> speech + background [%s]\n", path, tags); }
+            } else if (has_speech) {                           // frames in the turn: transcript, never a span (see note_speech)
+                note_speech(words);
+                if (tags[0]) note_caption(tags);
+                fprintf(stderr, "mmcat: %s -> video+speech; soundtrack fused as a transcript "
+                                "(the model cannot hear once frames share the context)\n", path);
             } else if (tags[0]) {                              // non-speech only: caption, no embedding (model can't hear music)
                 note_caption(tags);
                 fprintf(stderr, "mmcat: %s -> non-speech, captioned as transcript [%s]; no embedding\n", path, tags);
             } else {
                 fprintf(stderr, "mmcat: %s -> audio silent/blank, skipped\n", path);
             }
+        } else if (g_turn_video) {                             // no whisper: a poisoned span helps nobody
+            fprintf(stderr, "mmcat: %s: video+audio in one turn, and the model cannot hear once frames "
+                            "share the context (measured; any arrangement) — soundtrack DROPPED. Configure "
+                            "whisper (--whisper-model / LG_WHISPER_MODEL) to fuse it as a transcript.\n", path);
         } else if (room_for(1)) {
-            send_audio_frame(s, path, pcm, npad);              // whisper off/unavailable: send audio as before
+            send_audio_frame(s, path, pcm, npad);              // audio-only, whisper off: native ears as before
         }
         free(pcm);
     }
@@ -418,6 +449,13 @@ int main(int argc, char **argv) {
         snprintf(pre, sizeof pre, "%s\n", g_pre);
         send_frame(s, LG_FRAME_TEXT, 0, 0, pre, (uint32_t)strlen(pre));
     }
+    // The audio policy is TURN-scoped (frames poison hearing wherever they sit in
+    // the context, even sent after the audio), so scan all files before any is sent.
+    if (!g_no_video)
+        for (int i = 0; i < nf; i++) {
+            struct probe p;
+            if (probe_file(files[i], &p) == 0 && p.has_video) { g_turn_video = 1; break; }
+        }
     for (int i = 0; i < nf; i++) if (process_file(s, files[i]) != 0) { sock_close(s); return 1; }
 
     char line[8192];   // fuse any non-speech transcript note in front of the question

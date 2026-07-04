@@ -250,10 +250,30 @@ A stub "whisper" (any script that prints text) plus `--whisper-bin` exercises th
 streaming and barge paths deterministically with no whisper installed — that is
 how voicecat was validated end-to-end.
 
+## clausecat — the presentation cat
+
+The runner filters nothing by design — the reply is the raw token stream,
+thought channel and special tokens included, and presentation is the client's
+job. clausecat is that job, done once instead of inside every consumer: raw
+stream in, **one speakable clause per line** out. It drops `<|channel>…<channel|>`
+thought spans, drops `<…>` tokens (a lone `<` stays literal), and flushes a line
+at each clause boundary — `, ; : . ! ?` followed by a space — so a line-based TTS
+can start speaking at the first comma instead of the first newline. The model's
+own punctuation is the split policy; the runner repo's `docs/voice-sys.txt` is
+what makes it appear within the first few words.
+
+```
+voicecat /tmp/lg.sock … | clausecat | piper -m voice.onnx --output-raw --stream     | aplay -r 22050 -f S16_LE -t raw -c 1 -
+```
+
+Plain stdio, no sockets, no dependencies. `bench/clause_pipe.py` in the runner
+repo is the same policy in python — the sandbox where changes are tried first;
+the two are kept byte-identical (differential-tested on the same feeds).
+
 ## Build
 ```sh
 cmake -S . -B build && cmake --build build --config Release
-# -> build/mmcat, build/voicecat (build/Release/*.exe on Windows)
+# -> build/mmcat, build/voicecat, build/clausecat (build/Release/*.exe on Windows)
 ```
 Runtime: `ffmpeg` and `ffprobe` on `PATH`; `whisper-cli` + a whisper.cpp model for
 mmcat's captions/soundtrack transcripts and voicecat's streaming mode (point at

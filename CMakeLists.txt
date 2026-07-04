@@ -16,6 +16,11 @@ target_include_directories(mmcat PRIVATE proto)
 add_executable(voicecat src/voicecat.c)
 target_include_directories(voicecat PRIVATE proto)
 
+# clausecat — the presentation cat: raw reply stream in, one speakable clause
+# per line out (thought spans and special tokens stripped). Plain stdio, no
+# sockets; sits between voicecat and a line-based TTS.
+add_executable(clausecat src/clausecat.c)
+
 if(WIN32)
     target_link_libraries(mmcat PRIVATE ws2_32)   # winsock / AF_UNIX
     target_link_libraries(voicecat PRIVATE ws2_32)

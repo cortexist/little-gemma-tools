@@ -199,7 +199,7 @@ voicecat <socket> [--mic FFMPEG_INPUT | --stdin-pcm] [flags]
 - `--mic SPEC` — the ffmpeg capture input (default `-f alsa -i default` on Linux;
   e.g. `-f pulse -i default`, or `-f dshow -i audio=...` on Windows, where it is
   required)
-- `--stdin-pcm` — mono 16 kHz s16 PCM on stdin instead of a mic; `--rt` paces it
+- `--stdin-pcm` — mono 16 kHz s16 PCM on stdin instead of a mic; `--realtime` paces it
   live (this is also the test harness — see below)
 - `--whisper-model FILE` / `--whisper-bin PATH` — streaming-transcript mode
   (or `LG_WHISPER_MODEL` / `LG_WHISPER_BIN`)
@@ -243,7 +243,7 @@ voicecat /tmp/lg.sock
 
 # no mic? feed PCM at real-time pace — the whole pipeline (VAD, commits,
 # barge-in) runs exactly as live:
-ffmpeg -i clip.wav -f s16le -ac 1 -ar 16000 - | voicecat /tmp/lg.sock --stdin-pcm --rt
+ffmpeg -i clip.wav -f s16le -ac 1 -ar 16000 - | voicecat /tmp/lg.sock --stdin-pcm --realtime
 ```
 
 A stub "whisper" (any script that prints text) plus `--whisper-bin` exercises the

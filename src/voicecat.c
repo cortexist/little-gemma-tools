@@ -77,7 +77,7 @@ static const char *g_barge_note = "(interrupting) ";
 // Commit cadence must comfortably exceed one ASR invocation (~0.6s for CUDA
 // base.en via whisper-cli, process+model load included) or passes stack up
 // and the loop falls behind real time: keep commit_ms >= 3x the pass cost.
-static int g_commit_ms = 2500, g_hang_ms = 700, g_vad = 400, g_rt = 0;
+static int g_commit_ms = 2500, g_hang_ms = 700, g_vad = 400, g_realtime = 0;
 
 // ---- the wire (mmcat's idioms; the socket here is NON-BLOCKING) --------------
 static int send_all(sock_t s, const void *buf, size_t n) {
@@ -260,7 +260,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--mic") && i + 1 < argc)           mic = argv[++i];
         else if (!strcmp(argv[i], "--stdin-pcm"))                     stdin_pcm = 1;
-        else if (!strcmp(argv[i], "--rt"))                            g_rt = 1;
+        else if (!strcmp(argv[i], "--realtime"))                      g_realtime = 1;
         else if (!strcmp(argv[i], "--whisper-model") && i + 1 < argc) g_whisper_model = argv[++i];
         else if (!strcmp(argv[i], "--whisper-bin") && i + 1 < argc)   g_whisper_bin = argv[++i];
         else if (!strcmp(argv[i], "--barge-note") && i + 1 < argc)    g_barge_note = argv[++i];
@@ -272,11 +272,13 @@ int main(int argc, char **argv) {
     }
     if (!spath) {
         fprintf(stderr,
-            "usage: voicecat <socket> [--mic FFMPEG_INPUT | --stdin-pcm] [--rt]\n"
+            "usage: voicecat <socket> [--mic FFMPEG_INPUT | --stdin-pcm [--realtime]]\n"
             "                [--whisper-model FILE] [--whisper-bin PATH] [--barge-note TEXT]\n"
             "                [--commit-ms N=2500] [--hang-ms N=700] [--vad-level N=400]\n"
             "  --mic        ffmpeg input spec (default \"-f alsa -i default\" on Linux)\n"
-            "  --stdin-pcm  mono 16 kHz s16 PCM on stdin instead of a mic (--rt paces it live)\n"
+            "  --stdin-pcm  mono 16 kHz s16 PCM on stdin instead of a mic\n"
+            "  --realtime   pace stdin PCM at wall-clock rate, as a live mic would deliver it\n"
+            "               (replay recordings realistically; a real mic paces itself)\n"
             "  no whisper model -> whole utterances as native audio spans (vision-free sessions only)\n");
         return 1;
     }
@@ -333,13 +335,13 @@ int main(int argc, char **argv) {
     int in_utt = 0, onset = 0, sil_ms = 0, turn_open = 0, barged = 0;
     int pending = 0, barge_armed = 1, tstate = 0;    // replies awaited; one barge per utterance
     char rbuf[4096];
-    double rt0 = 0; long rtn = 0;                    // --rt deadline pacing
+    double rt0 = 0; long rtn = 0;                    // --realtime deadline pacing
 
     fprintf(stderr, "voicecat: %s, listening\n", whisper ? "streaming transcripts" : "native audio spans");
     for (;;) {
         size_t got = fread(frame, 2, FR_SAMP, src);
         int eof = got < FR_SAMP;
-        if (g_rt && !eof) {
+        if (g_realtime && !eof) {
             // pace to the frame's DEADLINE, not a flat sleep: a live mic keeps
             // capturing while a whisper pass runs and the loop catches up from
             // the buffer — this models that, so passes overlap "capture"

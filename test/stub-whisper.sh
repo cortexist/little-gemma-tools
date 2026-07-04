@@ -3,7 +3,7 @@
 # already trimmed away tell it where in the fixed utterance the window starts),
 # emits timestamped ~2.5s segments proportional to the window it is handed, and
 # sleeps like a fast whisper pass (~0.12x realtime of the WINDOW). Use with:
-#   voicecat <sock> --stdin-pcm --rt --whisper-model dummy --whisper-bin test/stub-whisper.sh
+#   voicecat <sock> --stdin-pcm --realtime --whisper-model dummy --whisper-bin test/stub-whisper.sh
 # and any >=10s PCM clip with speech-level energy. No ears, no external code.
 WAV=""; PROMPT=""
 while [ $# -gt 0 ]; do

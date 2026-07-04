@@ -270,6 +270,44 @@ Plain stdio, no sockets, no dependencies. `bench/clause_pipe.py` in the runner
 repo is the same policy in python — the sandbox where changes are tried first;
 the two are kept byte-identical (differential-tested on the same feeds).
 
+## script/voicedemo.py — the pipeline in a browser
+
+A minimal push-to-talk demo of the whole voice loop — the one place all the
+components meet: browser mic → whisper → little-gemma serve → clause split →
+piper `--stream` → the browser's speaker, with the reply text streaming in and,
+optionally, per-phoneme timings. A Flask app (the C-only convention bends here:
+a demo UI wants python) that serves over **ad-hoc HTTPS** — a self-signed
+certificate generated at startup — because browsers only grant microphone
+access to secure origins; accept the one-time certificate warning and the mic
+works from any machine on the network. `--http` for localhost-only runs.
+
+```sh
+pip install flask pyopenssl        # into the piper venv is fine
+python3 script/voicedemo.py --sock /tmp/lg.sock     --client  ~/repos/cortexist/little-gemma/build/run-cuda-i8     --piper   ~/repos/piper/.venv/bin/piper     --voice   ~/voices/en_US-kristin-medium.onnx     --whisper-bin ~/repos/whisper.cpp/build/bin/whisper-cli     --whisper-model ~/repos/whisper.cpp/models/ggml-base.en.bin
+# then open https://<host>:8443/ and push to talk
+```
+
+The browser receives one streamed response per turn, framed exactly like
+piper's mux (`[kind][u32 len][payload]`): `T` transcript, `R` reply clauses,
+and piper's `C`/`A`/`P` relayed through — the page is the demux.
+
+- **By default** the demo runs audio-only and works with the piper fork's
+  `main` branch (streaming synthesis; run `python3 -m piper.split <voice>`
+  once per voice).
+- **`--phonemes`** adds the phoneme timeline to the UI (text, appearing in
+  sync with the audio). It needs the piper fork's **`phoneme-stream`** branch
+  (`--output-mux`), and a voice whose alignment (w_ceil) output is exposed:
+  that branch's `piper.split` adds it automatically when the model allows;
+  see piper's `docs/ALIGNMENTS.md` for the details and the manual patch.
+- **Voices**: any [piper voice](https://huggingface.co/rhasspy/piper-voices)
+  works for audio after splitting, but stock downloads do *not* carry the
+  alignment output out of the box — the phoneme feature needs the re-split
+  (or patch) above.
+
+One conversation per app run (the serve connection lives as long as the
+process, so multi-turn context works); one user at a time, by design — it is
+a demo, not a server.
+
 ## Build
 ```sh
 cmake -S . -B build && cmake --build build --config Release

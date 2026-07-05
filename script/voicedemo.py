@@ -19,7 +19,6 @@
 # 'T' transcript, 'R' reply clause, and piper's 'C'/'A'/'P' relayed through —
 # the page is the demux. Requires flask + pyopenssl; ffmpeg on PATH.
 import argparse
-import base64
 import os
 import queue
 import re
@@ -77,17 +76,17 @@ PHONEME_TO_VISEME = {
 
 
 def load_visemes():
-    """lipsync/*.svg as data URIs; an empty dict degrades to labels only."""
-    uris = {}
+    """lipsync/*.svg as inline markup (stroke: currentColor — the shapes wear
+    the page's ink); an empty dict degrades to labels only."""
+    svgs = {}
     try:
         for name in sorted(os.listdir(LIPSYNC_DIR)):
             if name.endswith(".svg"):
-                with open(os.path.join(LIPSYNC_DIR, name), "rb") as f:
-                    uris[name[:-4]] = ("data:image/svg+xml;base64,"
-                                       + base64.b64encode(f.read()).decode())
+                with open(os.path.join(LIPSYNC_DIR, name), encoding="utf-8") as f:
+                    svgs[name[:-4]] = f.read().strip()
     except OSError:
         pass
-    return uris
+    return svgs
 
 
 # ---- the three companions -----------------------------------------------------
@@ -273,7 +272,8 @@ PAGE = """<!doctype html>
   #ph  { color:#7fa1d4; font-family:ui-monospace, monospace; word-wrap:break-word; }
   #mouthrow { display:flex; align-items:center; gap:1rem; margin-top:.4rem; }
   #mouthrow[hidden] { display:none; }   /* author display beats the hidden attr */
-  #mouth { width:80px; height:80px; border-radius:.5rem; }
+  #mouth { width:80px; height:80px; border-radius:.5rem; background:#181c22; color:#d6d9de; }
+  #mouth svg { width:100%; height:100%; }
   #vis  { color:#6b7280; font-family:ui-monospace, monospace; }
 </style>
 <h1>little-gemma — voice</h1>
@@ -281,7 +281,7 @@ PAGE = """<!doctype html>
 <div class="lbl">you said</div><div id="you"></div>
 <div class="lbl">reply</div><div id="reply"></div>
 <div class="lbl" id="phlbl" hidden>phonemes</div>
-<div id="mouthrow" hidden><img id="mouth" alt="mouth"><span id="vis"></span></div>
+<div id="mouthrow" hidden><span id="mouth"></span><span id="vis"></span></div>
 <div id="ph"></div>
 <script>
 // Viseme mouth (--phonemes): the say-app branch's Preston Blair shapes,
@@ -295,7 +295,7 @@ function visemeOf(p) {
 }
 function setMouth(v) {
   if (!v || !VISEMES[v]) return;
-  document.getElementById('mouth').src = VISEMES[v];
+  document.getElementById('mouth').innerHTML = VISEMES[v];
   document.getElementById('vis').textContent = v;
 }
 </script>

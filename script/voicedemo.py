@@ -407,7 +407,7 @@ const EMO_EYES = '<path d="M12 10.5 L12 13.5"/><path d="M28 10.5 L28 13.5"/>';
 const EMOTIONS = {
   happy:   emoSvg(EMO_EYES + '<path d="M8 23 C13 30 27 30 32 23"/>'),
   sad:     emoSvg(EMO_EYES + '<path d="M8 29 C13 22.5 27 22.5 32 29"/>'),
-  neutral: emoSvg(EMO_EYES + '<path d="M10 26 L30 26"/>'),
+  neutral: emoSvg(EMO_EYES + '<path d="M8 24.5 C13 27 27 27 32 24.5"/>'),
   angry:   emoSvg(EMO_EYES + '<path d="M8 8.5 L15 11.5"/><path d="M32 8.5 L25 11.5"/>'
                   + '<path d="M9 28 C14 24 26 24 31 28"/>'),
 };

@@ -266,9 +266,20 @@ what makes it appear within the first few words.
 voicecat /tmp/lg.sock … | clausecat | piper -m voice.onnx --output-raw --stream     | aplay -r 22050 -f S16_LE -t raw -c 1 -
 ```
 
+With `--allow-control-token PATTERN` ('*' = any run), a
+`<|tool_call>…<tool_call|>` span matching PATTERN passes through verbatim as
+its own line, holding its place among the clauses — the in-band channel that
+lets an LLM steer the voice (`set_voice{…}`, consumed downstream by the piper
+fork's `piper.control`) or any future rig command. Spans that do NOT match
+are dropped whole: a tool call's payload is never spoken.
+
+```
+voicecat … | clausecat --allow-control-token '<|tool_call>call:set_voice{*}<tool_call|>'     | piper -m multi-speaker.onnx --output-mux --stream | python3 -m piper.demux …
+```
+
 Plain stdio, no sockets, no dependencies. `bench/clause_pipe.py` in the runner
 repo is the same policy in python — the sandbox where changes are tried first;
-the two are kept byte-identical (differential-tested on the same feeds).
+the two are kept byte-identical (differential-tested on `bench/clause_cases.txt`).
 
 ## script/voicedemo.py — the pipeline in a browser
 

@@ -204,29 +204,73 @@ PAGE = """<!doctype html>
   #you, #reply { min-height:1.5rem; }
   #ph  { color:#7fa1d4; font-family:ui-monospace, monospace; word-wrap:break-word; }
 </style>
-<h1>little-gemma — push to talk</h1>
-<button id="talk">start talking</button> <span id="status"></span>
+<h1>little-gemma — voice</h1>
+<button id="talk">enable microphone</button> <span id="status"></span>
 <div class="lbl">you said</div><div id="you"></div>
 <div class="lbl">reply</div><div id="reply"></div>
 <div class="lbl" id="phlbl" hidden>phonemes</div><div id="ph"></div>
 <script>
+// Hands-free turn taking: one click arms the mic; an energy VAD (voicecat's
+// parameters: onset above threshold, HANG_MS of silence closes the turn)
+// starts and stops the capture. While the mic is idle the recorder restarts
+// every PREROLL_MS so the utterance keeps up to that much lead-in — the
+// first syllable is never clipped. Listening gates off while the reply
+// audio plays (no echo cancellation: an open-air mic would hear the voice).
+const VAD_THRESH = 0.02, HANG_MS = 700, ONSET_N = 3, PREROLL_MS = 300;
 let rec = null, chunks = [], ctx = null, cursor = 0, rate = 22050, sched = null;
+let armed = false, talking = false, silentSince = 0, onsetRun = 0, busy = false;
 const $ = id => document.getElementById(id);
 
 $('talk').onclick = async () => {
-  if (rec && rec.state === 'recording') { rec.stop(); return; }
+  if (armed) { location.reload(); return; }              // disarm = reset
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   if (!ctx) ctx = new AudioContext();
-  chunks = [];
-  rec = new MediaRecorder(stream);
-  rec.ondataavailable = e => chunks.push(e.data);
-  rec.onstop = () => { stream.getTracks().forEach(t => t.stop()); send(new Blob(chunks)); };
-  rec.start();
-  $('talk').textContent = 'stop & send'; $('talk').classList.add('rec');
+  const src = ctx.createMediaStreamSource(stream);
+  const an = ctx.createAnalyser();
+  an.fftSize = 1024;
+  src.connect(an);
+  const buf = new Float32Array(an.fftSize);
+  const restart = () => {
+    chunks = [];
+    rec = new MediaRecorder(stream);
+    rec.ondataavailable = e => chunks.push(e.data);
+    rec.start();
+  };
+  restart();
+  armed = true;
+  $('talk').textContent = 'disarm mic';
+  $('status').textContent = 'listening';
+  let lastRestart = performance.now();
+  setInterval(() => {
+    if (!armed || busy) return;
+    an.getFloatTimeDomainData(buf);
+    let rms = 0;
+    for (let i = 0; i < buf.length; i++) rms += buf[i] * buf[i];
+    rms = Math.sqrt(rms / buf.length);
+    const speaking = ctx.currentTime < cursor + 0.3;     // reply still playing
+    const now = performance.now();
+    if (!talking) {
+      if (!speaking && rms > VAD_THRESH && ++onsetRun >= ONSET_N) {
+        talking = true; silentSince = 0;
+        $('talk').classList.add('rec'); $('status').textContent = 'recording';
+      } else {
+        if (rms <= VAD_THRESH) onsetRun = 0;
+        if (now - lastRestart > PREROLL_MS) { rec.stop(); rec.onstop = restart; lastRestart = now; }
+      }
+    } else if (rms > VAD_THRESH) {
+      silentSince = 0;
+    } else if (!silentSince) {
+      silentSince = now;
+    } else if (now - silentSince > HANG_MS) {            // end of utterance
+      talking = false; onsetRun = 0; busy = true;
+      $('talk').classList.remove('rec');
+      rec.onstop = () => { send(new Blob(chunks)); restart(); lastRestart = performance.now(); };
+      rec.stop();
+    }
+  }, 50);
 };
 
 async function send(blob) {
-  $('talk').textContent = 'start talking'; $('talk').classList.remove('rec');
   $('you').textContent = '…'; $('reply').textContent = ''; $('ph').textContent = '';
   $('status').textContent = 'thinking';
   const res = await fetch('converse', { method: 'POST', body: blob });
@@ -245,7 +289,8 @@ async function send(blob) {
       buf = buf.slice(5 + len);
     }
   }
-  $('status').textContent = '';
+  busy = false;
+  $('status').textContent = armed ? 'listening' : '';
 }
 
 function onframe(kind, payload) {

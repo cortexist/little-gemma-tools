@@ -19,6 +19,7 @@
 # 'T' transcript, 'R' reply clause, and piper's 'C'/'A'/'P' relayed through —
 # the page is the demux. Requires flask + pyopenssl; ffmpeg on PATH.
 import argparse
+import codecs
 import os
 import queue
 import re
@@ -40,9 +41,36 @@ CLAUSE = re.compile(r"[,;:.!?](?=[\s\*\)\"'\]])")
 TAG = re.compile(r"<[^<>]{1,24}>")
 CHANNEL = re.compile(r"<\|channel>.*?(<channel\|>|$)", re.S)
 
+# The control spans this demo lets through to piper (clausecat's
+# --allow-control-token, hardcoded to the voice switch), and how a speaker
+# value is pulled out for the browser when no mux carries it.
+ALLOW_CONTROL = "<|tool_call>call:set_voice{*}<tool_call|>"
+SET_VOICE = re.compile(r"set_voice\s*\{(.*)\}")
+
 
 def speakable(raw):
     return TAG.sub("", CHANNEL.sub("", raw))
+
+
+def glob_match(s, p):
+    """'*' = any run; the same iterative matcher as clausecat."""
+    si = pi = 0
+    star_p = star_s = -1
+    while si < len(s):
+        if pi < len(p) and p[pi] == "*":
+            pi += 1
+            star_p, star_s = pi, si
+        elif pi < len(p) and p[pi] == s[si]:
+            pi += 1
+            si += 1
+        elif star_p >= 0:
+            star_s += 1
+            pi, si = star_p, star_s
+        else:
+            return False
+    while pi < len(p) and p[pi] == "*":
+        pi += 1
+    return pi == len(p)
 
 
 # ---- visemes (--phonemes): the say-app experiment's Preston Blair set --------
@@ -216,21 +244,84 @@ class Pipeline:
                         self._lg_spawn()
                         return
 
-                    raw, spoken = b"", 0
+                    def control(span_text):
+                        """An allowed control span goes to piper as its own
+                        line (it switches the speaker); dropped whole
+                        otherwise. Without a mux to carry piper's M frame
+                        (raw mode), the app reports the speaker itself."""
+                        if not glob_match(span_text, ALLOW_CONTROL):
+                            return
+                        flush()                              # hold its place among clauses
+                        try:
+                            self.piper.stdin.write(span_text.encode("utf-8") + b"\n")
+                            self.piper.stdin.flush()
+                        except (BrokenPipeError, OSError):
+                            pass
+                        if not self.args.phonemes:
+                            m2 = SET_VOICE.search(TAG.sub("", span_text))
+                            if m2:
+                                value = m2.group(1).split(":", 1)[-1].strip().strip("\"'")
+                                q.put(frame(b"M", value.encode("utf-8")))
+
+                    # clausecat's state machine, ported (see bench/clause_pipe.py):
+                    # thought spans dropped, allowed control spans passed through,
+                    # clauses flushed at punctuation-plus-space boundaries.
+                    clause = [""]
+
+                    def flush():
+                        out = clause[0].strip()
+                        clause[0] = ""
+                        if out:
+                            speak(out)
+
+                    def add(c):
+                        if clause[0] and clause[0][-1] in ",;:.!?" and c in " \t\n\r\f\v*)\"']":
+                            flush()
+                        clause[0] += c
+
+                    tag, thought, cn = "", False, 0
+                    span, tcall, tcn = "", False, 0
+                    CLOSE, TCLOSE = "<channel|>", "<tool_call|>"
+                    utf8 = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                    raw = b""
                     while b"<turn|>" not in raw:             # replies may contain newlines;
                         b = self.lg.stdout.read(1)           # only the marker ends the turn
                         if not b:
                             break
                         raw += b
-                        sp = speakable(raw.decode("utf-8", errors="replace"))
-                        m = None
-                        for m in CLAUSE.finditer(sp, spoken):
-                            pass
-                        if m is not None and m.end() > spoken:
-                            clause, spoken = sp[spoken:m.end()], m.end()
-                            speak(clause)
+                        for c in utf8.decode(b):
+                            if thought:
+                                cn = cn + 1 if c == CLOSE[cn] else (1 if c == CLOSE[0] else 0)
+                                if cn == len(CLOSE):
+                                    thought, cn = False, 0
+                                continue
+                            if tcall:
+                                span += c
+                                tcn = tcn + 1 if c == TCLOSE[tcn] else (1 if c == TCLOSE[0] else 0)
+                                if tcn == len(TCLOSE):
+                                    control(span)
+                                    span, tcall, tcn = "", False, 0
+                                continue
+                            if tag:
+                                if c == ">":
+                                    if tag == "<|channel":
+                                        thought = True
+                                    elif tag == "<|tool_call":
+                                        span, tcall, tcn = "<|tool_call>", True, 0
+                                    tag = ""
+                                    continue
+                                if c != "<" and len(tag) < 25:
+                                    tag += c
+                                    continue
+                                for t in tag:
+                                    add(t)
+                                tag = ""
+                            if c == "<":
+                                tag = "<"
+                                continue
+                            add(c)
                     self.lg.stdout.read(1)                   # the client's trailing newline
-                    speak(speakable(raw.decode("utf-8", errors="replace"))[spoken:])
+                    flush()
                 finally:
                     reply_done.set()
 
@@ -270,16 +361,20 @@ PAGE = """<!doctype html>
          margin:1.2rem 0 .2rem; }
   #you, #reply { min-height:1.5rem; }
   #ph  { color:#7fa1d4; font-family:ui-monospace, monospace; word-wrap:break-word; }
-  #mouthrow { display:flex; align-items:center; gap:1rem; margin-top:.4rem; }
-  #mouthrow[hidden] { display:none; }   /* author display beats the hidden attr */
+  #mouthrow, #voicerow { display:flex; align-items:center; gap:1rem; margin-top:.4rem; }
+  #mouthrow[hidden], #voicerow[hidden] { display:none; }   /* author display beats hidden */
   #mouth { width:80px; height:80px; border-radius:.5rem; background:#181c22; color:#d6d9de; }
   #mouth svg { width:100%; height:100%; }
-  #vis  { color:#6b7280; font-family:ui-monospace, monospace; }
+  #spk { width:56px; height:56px; border-radius:.5rem; background:#181c22; color:#d6d9de; }
+  #spk svg { width:100%; height:100%; }
+  #vis, #spkname { color:#6b7280; font-family:ui-monospace, monospace; }
 </style>
 <h1>little-gemma — voice</h1>
 <button id="talk">enable microphone</button> <span id="status"></span>
 <div class="lbl">you said</div><div id="you"></div>
 <div class="lbl">reply</div><div id="reply"></div>
+<div class="lbl" id="voicelbl" hidden>voice</div>
+<div id="voicerow" hidden><span id="spk"></span><span id="spkname"></span></div>
 <div class="lbl" id="phlbl" hidden>phonemes</div>
 <div id="mouthrow" hidden><span id="mouth"></span><span id="vis"></span></div>
 <div id="ph"></div>
@@ -297,6 +392,31 @@ function setMouth(v) {
   if (!v || !VISEMES[v]) return;
   document.getElementById('mouth').innerHTML = VISEMES[v];
   document.getElementById('vis').textContent = v;
+}
+
+// Speaker indicator (M frames): the same one-stroke language as the mouth.
+// Known mood names get a face; anything else gets the bust plus its name.
+function spkSvg(inner) {
+  return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" fill="none"'
+       + ' stroke="currentColor" stroke-width="2.2" stroke-linecap="round"'
+       + ' stroke-linejoin="round">' + inner + '</svg>';
+}
+const SPK_EYES = '<path d="M15.5 16.5 L15.5 18"/><path d="M24.5 16.5 L24.5 18"/>';
+const SPK_HEAD = '<circle cx="20" cy="20" r="13"/>';
+const SPK_FACES = {
+  happy:   spkSvg(SPK_HEAD + SPK_EYES + '<path d="M14.5 24 C17 27.5 23 27.5 25.5 24"/>'),
+  sad:     spkSvg(SPK_HEAD + SPK_EYES + '<path d="M14.5 26.5 C17 23 23 23 25.5 26.5"/>'),
+  neutral: spkSvg(SPK_HEAD + SPK_EYES + '<path d="M15.5 25 L24.5 25"/>'),
+  angry:   spkSvg(SPK_HEAD + SPK_EYES + '<path d="M13.5 13.5 L17 15.5"/><path d="M26.5 13.5 L23 15.5"/>'
+                  + '<path d="M14.5 26 C17 23.5 23 23.5 25.5 26"/>'),
+};
+const SPK_BUST = spkSvg('<circle cx="20" cy="14.5" r="6"/>'
+                        + '<path d="M8.5 31.5 C10 23.5 30 23.5 31.5 31.5"/>');
+function setSpeaker(name) {
+  document.getElementById('voicelbl').hidden = false;
+  document.getElementById('voicerow').hidden = false;
+  document.getElementById('spk').innerHTML = SPK_FACES[name] || SPK_BUST;
+  document.getElementById('spkname').textContent = name;
 }
 </script>
 <script>
@@ -398,6 +518,7 @@ function onframe(kind, payload) {
     if (Object.keys(VISEMES).length) { $('mouthrow').hidden = false; setMouth(REST); }
     sched = text();
   }
+  else if (kind === 'M') setSpeaker(text());
   else if (kind === 'P') playPCM(payload);
 }
 

@@ -418,6 +418,8 @@ function setSpeaker(name) {
   document.getElementById('spk').innerHTML = SPK_FACES[name] || SPK_BUST;
   document.getElementById('spkname').textContent = name;
 }
+// The active voice shows from the start; set_voice switches update it.
+window.addEventListener('DOMContentLoaded', () => setSpeaker({{ voice|tojson }}));
 </script>
 <script>
 // Hands-free turn taking: one click arms the mic; an energy VAD (voicecat's
@@ -555,10 +557,18 @@ app = Flask(__name__)
 pipe = None
 
 
+def voice_name(path):
+    """A short display name for the voice: en_US-lessac-medium -> lessac."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    parts = stem.split("-")
+    return parts[1] if len(parts) >= 2 else stem
+
+
 @app.route("/")
 def index():
     return render_template_string(PAGE, visemes=load_visemes(),
-                                  ph2vis=PHONEME_TO_VISEME, rest=REST_VISEME)
+                                  ph2vis=PHONEME_TO_VISEME, rest=REST_VISEME,
+                                  voice=voice_name(pipe.args.voice))
 
 
 @app.route("/converse", methods=["POST"])

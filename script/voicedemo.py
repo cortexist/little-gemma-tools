@@ -361,20 +361,20 @@ PAGE = """<!doctype html>
          margin:1.2rem 0 .2rem; }
   #you, #reply { min-height:1.5rem; }
   #ph  { color:#7fa1d4; font-family:ui-monospace, monospace; word-wrap:break-word; }
-  #mouthrow, #voicerow { display:flex; align-items:center; gap:1rem; margin-top:.4rem; }
-  #mouthrow[hidden], #voicerow[hidden] { display:none; }   /* author display beats hidden */
+  #mouthrow, #emorow { display:flex; align-items:center; gap:1rem; margin-top:.4rem; }
+  #mouthrow[hidden] { display:none; }   /* author display beats the hidden attr */
   #mouth { width:80px; height:80px; border-radius:.5rem; background:#181c22; color:#d6d9de; }
   #mouth svg { width:100%; height:100%; }
-  #spk { width:56px; height:56px; border-radius:.5rem; background:#181c22; color:#d6d9de; }
-  #spk svg { width:100%; height:100%; }
-  #vis, #spkname { color:#6b7280; font-family:ui-monospace, monospace; }
+  #emo { width:56px; height:56px; border-radius:.5rem; background:#181c22; color:#d6d9de; }
+  #emo svg { width:100%; height:100%; }
+  #vis, #emoname { color:#6b7280; font-family:ui-monospace, monospace; }
 </style>
 <h1>little-gemma — voice</h1>
 <button id="talk">enable microphone</button> <span id="status"></span>
 <div class="lbl">you said</div><div id="you"></div>
 <div class="lbl">reply</div><div id="reply"></div>
-<div class="lbl" id="voicelbl" hidden>voice</div>
-<div id="voicerow" hidden><span id="spk"></span><span id="spkname"></span></div>
+<div class="lbl">emotion</div>
+<div id="emorow"><span id="emo"></span><span id="emoname"></span></div>
 <div class="lbl" id="phlbl" hidden>phonemes</div>
 <div id="mouthrow" hidden><span id="mouth"></span><span id="vis"></span></div>
 <div id="ph"></div>
@@ -394,32 +394,30 @@ function setMouth(v) {
   document.getElementById('vis').textContent = v;
 }
 
-// Speaker indicator (M frames): the same one-stroke language as the mouth.
-// Known mood names get a face; anything else gets the bust plus its name.
-function spkSvg(inner) {
+// Emotion indicator (M frames): the same one-stroke language as the mouth.
+// A set_voice value naming a known emotion gets its face; anything the
+// mapping does not know (a bare speaker id, a voice name) reads as neutral —
+// this row shows the EXPRESSION channel, not speaker identity.
+function emoSvg(inner) {
   return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" fill="none"'
        + ' stroke="currentColor" stroke-width="2.2" stroke-linecap="round"'
        + ' stroke-linejoin="round">' + inner + '</svg>';
 }
-const SPK_EYES = '<path d="M15.5 16.5 L15.5 18"/><path d="M24.5 16.5 L24.5 18"/>';
-const SPK_HEAD = '<circle cx="20" cy="20" r="13"/>';
-const SPK_FACES = {
-  happy:   spkSvg(SPK_HEAD + SPK_EYES + '<path d="M14.5 24 C17 27.5 23 27.5 25.5 24"/>'),
-  sad:     spkSvg(SPK_HEAD + SPK_EYES + '<path d="M14.5 26.5 C17 23 23 23 25.5 26.5"/>'),
-  neutral: spkSvg(SPK_HEAD + SPK_EYES + '<path d="M15.5 25 L24.5 25"/>'),
-  angry:   spkSvg(SPK_HEAD + SPK_EYES + '<path d="M13.5 13.5 L17 15.5"/><path d="M26.5 13.5 L23 15.5"/>'
+const EMO_EYES = '<path d="M15.5 16.5 L15.5 18"/><path d="M24.5 16.5 L24.5 18"/>';
+const EMO_HEAD = '<circle cx="20" cy="20" r="13"/>';
+const EMOTIONS = {
+  happy:   emoSvg(EMO_HEAD + EMO_EYES + '<path d="M14.5 24 C17 27.5 23 27.5 25.5 24"/>'),
+  sad:     emoSvg(EMO_HEAD + EMO_EYES + '<path d="M14.5 26.5 C17 23 23 23 25.5 26.5"/>'),
+  neutral: emoSvg(EMO_HEAD + EMO_EYES + '<path d="M15.5 25 L24.5 25"/>'),
+  angry:   emoSvg(EMO_HEAD + EMO_EYES + '<path d="M13.5 13.5 L17 15.5"/><path d="M26.5 13.5 L23 15.5"/>'
                   + '<path d="M14.5 26 C17 23.5 23 23.5 25.5 26"/>'),
 };
-const SPK_BUST = spkSvg('<circle cx="20" cy="14.5" r="6"/>'
-                        + '<path d="M8.5 31.5 C10 23.5 30 23.5 31.5 31.5"/>');
-function setSpeaker(name) {
-  document.getElementById('voicelbl').hidden = false;
-  document.getElementById('voicerow').hidden = false;
-  document.getElementById('spk').innerHTML = SPK_FACES[name] || SPK_BUST;
-  document.getElementById('spkname').textContent = name;
+function setEmotion(name) {
+  const known = EMOTIONS[name] !== undefined;
+  document.getElementById('emo').innerHTML = EMOTIONS[known ? name : 'neutral'];
+  document.getElementById('emoname').textContent = known ? name : 'neutral';
 }
-// The active voice shows from the start; set_voice switches update it.
-window.addEventListener('DOMContentLoaded', () => setSpeaker({{ voice|tojson }}));
+window.addEventListener('DOMContentLoaded', () => setEmotion('neutral'));
 </script>
 <script>
 // Hands-free turn taking: one click arms the mic; an energy VAD (voicecat's
@@ -520,7 +518,7 @@ function onframe(kind, payload) {
     if (Object.keys(VISEMES).length) { $('mouthrow').hidden = false; setMouth(REST); }
     sched = text();
   }
-  else if (kind === 'M') setSpeaker(text());
+  else if (kind === 'M') setEmotion(text());
   else if (kind === 'P') playPCM(payload);
 }
 
@@ -557,18 +555,10 @@ app = Flask(__name__)
 pipe = None
 
 
-def voice_name(path):
-    """A short display name for the voice: en_US-lessac-medium -> lessac."""
-    stem = os.path.splitext(os.path.basename(path))[0]
-    parts = stem.split("-")
-    return parts[1] if len(parts) >= 2 else stem
-
-
 @app.route("/")
 def index():
     return render_template_string(PAGE, visemes=load_visemes(),
-                                  ph2vis=PHONEME_TO_VISEME, rest=REST_VISEME,
-                                  voice=voice_name(pipe.args.voice))
+                                  ph2vis=PHONEME_TO_VISEME, rest=REST_VISEME)
 
 
 @app.route("/converse", methods=["POST"])

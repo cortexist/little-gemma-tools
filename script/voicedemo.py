@@ -50,8 +50,8 @@ class Pipeline:
     def __init__(self, args):
         self.args = args
         self.lock = threading.Lock()          # one turn at a time
-        self.lg = subprocess.Popen([args.client, "-c", args.sock],
-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.lg = None
+        self._lg_spawn()
         piper_out = ["--output-mux"] if args.phonemes else ["--output-raw"]
         self.piper = subprocess.Popen(
             [args.piper, "-m", args.voice] + piper_out + ["--stream"],
@@ -60,6 +60,18 @@ class Pipeline:
         self.sink = None                      # the active turn's frame queue
         self.last_pcm = 0.0
         threading.Thread(target=self._piper_reader, daemon=True).start()
+
+    def _lg_spawn(self):
+        """(Re)connect the conversation: one `run -c` client per lg session.
+        The server closes the session when the context fills, and the client
+        exits with it — respawning starts a FRESH conversation."""
+        self.lg = subprocess.Popen([self.args.client, "-c", self.args.sock],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        time.sleep(0.3)
+        if self.lg.poll() is not None:
+            raise RuntimeError(
+                "lg client exited immediately — is little-gemma serving on %s?"
+                % self.args.sock)
 
     def _emit(self, kind, payload):
         self.last_pcm = time.monotonic()
@@ -116,43 +128,61 @@ class Pipeline:
 
             reply_done = threading.Event()
 
+            def speak(clause):
+                clause = " ".join(clause.split())            # one piper line per clause
+                if clause:
+                    q.put(frame(b"R", clause.encode("utf-8")))
+                    self.piper.stdin.write(clause.encode("utf-8") + b"\n")
+                    self.piper.stdin.flush()
+
             def reply_to_clauses():
-                self.lg.stdin.write(text.encode("utf-8") + b"\n")
-                self.lg.stdin.flush()
-                buf, spoken = "", 0
-                while True:
-                    b = self.lg.stdout.read(1)
+                # The lg client lives one conversation: the server closes the
+                # session when the context fills, and the client exits with
+                # it. Respawn (a fresh conversation) instead of dying.
+                try:
+                    if self.lg.poll() is not None:
+                        raise BrokenPipeError
+                    self.lg.stdin.write(text.encode("utf-8") + b"\n")
+                    self.lg.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    speak("The voice session restarted. Please ask again.")
+                    self._lg_spawn()
+                    reply_done.set()
+                    return
+
+                raw, spoken = b"", 0
+                while b"<turn|>" not in raw:                 # replies may contain newlines;
+                    b = self.lg.stdout.read(1)               # only the marker ends the turn
                     if not b:
                         break
-                    ch = b.decode("utf-8", errors="ignore")
-                    if ch == "\n":                           # client marks end of turn
-                        break
-                    buf += ch
-                    sp = speakable(buf)
+                    raw += b
+                    sp = speakable(raw.decode("utf-8", errors="replace"))
                     m = None
                     for m in CLAUSE.finditer(sp, spoken):
                         pass
                     if m is not None and m.end() > spoken:
-                        clause = sp[spoken:m.end()].strip()
-                        spoken = m.end()
-                        if clause:
-                            q.put(frame(b"R", clause.encode("utf-8")))
-                            self.piper.stdin.write(clause.encode("utf-8") + b"\n")
-                            self.piper.stdin.flush()
-                tail = speakable(buf)[spoken:].strip()
-                if tail:
-                    q.put(frame(b"R", tail.encode("utf-8")))
-                    self.piper.stdin.write(tail.encode("utf-8") + b"\n")
-                    self.piper.stdin.flush()
+                        clause, spoken = sp[spoken:m.end()], m.end()
+                        speak(clause)
+                self.lg.stdout.read(1)                       # the client's trailing newline
+                speak(speakable(raw.decode("utf-8", errors="replace"))[spoken:])
                 reply_done.set()
 
             threading.Thread(target=reply_to_clauses, daemon=True).start()
             self.last_pcm = time.monotonic()
+            heard = False                                    # any PCM this turn yet?
             while True:
                 try:
-                    yield q.get(timeout=0.1)
+                    item = q.get(timeout=0.1)
+                    heard = heard or item[:1] == b"P"
+                    yield item
                 except queue.Empty:
-                    if reply_done.is_set() and time.monotonic() - self.last_pcm > 0.6:
+                    if not reply_done.is_set():
+                        continue
+                    # After the reply, wait 0.6s of TTS quiet — but give the
+                    # FIRST audio a longer grace (piper's first-ever synthesis
+                    # pays espeak init and can exceed the quiet window).
+                    idle = time.monotonic() - self.last_pcm
+                    if idle > (0.6 if heard else 5.0):
                         break
             self.sink = None
             yield frame(b"E", b"")

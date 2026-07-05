@@ -97,14 +97,11 @@ class Pipeline:
         self.lock = threading.Lock()          # one turn at a time
         self.lg = None
         self._lg_spawn()
-        piper_out = ["--output-mux"] if args.phonemes else ["--output-raw"]
-        self.piper = subprocess.Popen(
-            [args.piper, "-m", args.voice] + piper_out + ["--stream"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL)
+        self.piper = None
+        self.piper_cfg = None                 # piper's startup 'C' frame payload
         self.sink = None                      # the active turn's frame queue
         self.last_pcm = 0.0
-        threading.Thread(target=self._piper_reader, daemon=True).start()
+        self._piper_spawn()
 
     def _lg_spawn(self):
         """(Re)connect the conversation: one `run -c` client per lg session.
@@ -118,8 +115,24 @@ class Pipeline:
                 "lg client exited immediately — is little-gemma serving on %s?"
                 % self.args.sock)
 
+    def _piper_spawn(self):
+        piper_out = ["--output-mux"] if self.args.phonemes else ["--output-raw"]
+        self.piper = subprocess.Popen(
+            [self.args.piper, "-m", self.args.voice] + piper_out + ["--stream"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL)
+        time.sleep(0.3)
+        if self.piper.poll() is not None:
+            raise RuntimeError(
+                "piper exited immediately — does it support %s --stream? "
+                "(run `%s --help`; the voice halves come from `python3 -m piper.split`)"
+                % (piper_out[0], self.args.piper))
+        threading.Thread(target=self._piper_reader, daemon=True).start()
+
     def _emit(self, kind, payload):
         self.last_pcm = time.monotonic()
+        if kind == b"C":
+            self.piper_cfg = payload          # remember for every later turn
         sink = self.sink
         if sink is not None:
             sink.put(frame(kind, payload))
@@ -168,7 +181,11 @@ class Pipeline:
 
             q = queue.Queue()
             self.sink = q
-            if not self.args.phonemes:                       # mux mode sends its own 'C'
+            if self.piper.poll() is not None:                # a dead mouth respawns
+                self._piper_spawn()
+            if self.piper_cfg is not None:                   # piper sent 'C' once at startup
+                yield frame(b"C", self.piper_cfg)
+            else:
                 yield frame(b"C", b"rate=%d\nwidth=2\nchannels=1\n" % self.args.rate)
 
             reply_done = threading.Event()
@@ -177,40 +194,46 @@ class Pipeline:
                 clause = " ".join(clause.split())            # one piper line per clause
                 if clause:
                     q.put(frame(b"R", clause.encode("utf-8")))
-                    self.piper.stdin.write(clause.encode("utf-8") + b"\n")
-                    self.piper.stdin.flush()
+                    try:
+                        self.piper.stdin.write(clause.encode("utf-8") + b"\n")
+                        self.piper.stdin.flush()
+                    except (BrokenPipeError, OSError):       # text still flows, audio doesn't
+                        pass
 
             def reply_to_clauses():
                 # The lg client lives one conversation: the server closes the
                 # session when the context fills, and the client exits with
-                # it. Respawn (a fresh conversation) instead of dying.
+                # it. Respawn (a fresh conversation) instead of dying — and
+                # reply_done ALWAYS fires, whatever this thread hits, or the
+                # response generator would spin forever holding the turn lock.
                 try:
-                    if self.lg.poll() is not None:
-                        raise BrokenPipeError
-                    self.lg.stdin.write(text.encode("utf-8") + b"\n")
-                    self.lg.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    speak("The voice session restarted. Please ask again.")
-                    self._lg_spawn()
-                    reply_done.set()
-                    return
+                    try:
+                        if self.lg.poll() is not None:
+                            raise BrokenPipeError
+                        self.lg.stdin.write(text.encode("utf-8") + b"\n")
+                        self.lg.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        speak("The voice session restarted. Please ask again.")
+                        self._lg_spawn()
+                        return
 
-                raw, spoken = b"", 0
-                while b"<turn|>" not in raw:                 # replies may contain newlines;
-                    b = self.lg.stdout.read(1)               # only the marker ends the turn
-                    if not b:
-                        break
-                    raw += b
-                    sp = speakable(raw.decode("utf-8", errors="replace"))
-                    m = None
-                    for m in CLAUSE.finditer(sp, spoken):
-                        pass
-                    if m is not None and m.end() > spoken:
-                        clause, spoken = sp[spoken:m.end()], m.end()
-                        speak(clause)
-                self.lg.stdout.read(1)                       # the client's trailing newline
-                speak(speakable(raw.decode("utf-8", errors="replace"))[spoken:])
-                reply_done.set()
+                    raw, spoken = b"", 0
+                    while b"<turn|>" not in raw:             # replies may contain newlines;
+                        b = self.lg.stdout.read(1)           # only the marker ends the turn
+                        if not b:
+                            break
+                        raw += b
+                        sp = speakable(raw.decode("utf-8", errors="replace"))
+                        m = None
+                        for m in CLAUSE.finditer(sp, spoken):
+                            pass
+                        if m is not None and m.end() > spoken:
+                            clause, spoken = sp[spoken:m.end()], m.end()
+                            speak(clause)
+                    self.lg.stdout.read(1)                   # the client's trailing newline
+                    speak(speakable(raw.decode("utf-8", errors="replace"))[spoken:])
+                finally:
+                    reply_done.set()
 
             threading.Thread(target=reply_to_clauses, daemon=True).start()
             self.last_pcm = time.monotonic()
@@ -249,6 +272,7 @@ PAGE = """<!doctype html>
   #you, #reply { min-height:1.5rem; }
   #ph  { color:#7fa1d4; font-family:ui-monospace, monospace; word-wrap:break-word; }
   #mouthrow { display:flex; align-items:center; gap:1rem; margin-top:.4rem; }
+  #mouthrow[hidden] { display:none; }   /* author display beats the hidden attr */
   #mouth { width:80px; height:80px; border-radius:.5rem; }
   #vis  { color:#6b7280; font-family:ui-monospace, monospace; }
 </style>
@@ -337,6 +361,13 @@ $('talk').onclick = async () => {
 };
 
 async function send(blob) {
+  try { await send_(blob); } finally {      // never leave the VAD stuck on `busy`
+    busy = false;
+    $('status').textContent = armed ? 'listening' : '';
+  }
+}
+
+async function send_(blob) {
   $('you').textContent = '…'; $('reply').textContent = ''; $('ph').textContent = '';
   $('status').textContent = 'thinking';
   const res = await fetch('converse', { method: 'POST', body: blob });
@@ -355,8 +386,6 @@ async function send(blob) {
       buf = buf.slice(5 + len);
     }
   }
-  busy = false;
-  $('status').textContent = armed ? 'listening' : '';
 }
 
 function onframe(kind, payload) {

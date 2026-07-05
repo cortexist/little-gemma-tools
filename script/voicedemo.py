@@ -401,14 +401,15 @@ function emoSvg(inner) {
        + ' stroke="currentColor" stroke-width="2.2" stroke-linecap="round"'
        + ' stroke-linejoin="round">' + inner + '</svg>';
 }
-const EMO_EYES = '<path d="M15.5 16.5 L15.5 18"/><path d="M24.5 16.5 L24.5 18"/>';
-const EMO_HEAD = '<circle cx="20" cy="20" r="13"/>';
+// No head outline: just eyes and a mouth, drawn at the same scale as the
+// lipsync shapes so the two tiles read as one face split in half.
+const EMO_EYES = '<path d="M12 10.5 L12 13.5"/><path d="M28 10.5 L28 13.5"/>';
 const EMOTIONS = {
-  happy:   emoSvg(EMO_HEAD + EMO_EYES + '<path d="M14.5 24 C17 27.5 23 27.5 25.5 24"/>'),
-  sad:     emoSvg(EMO_HEAD + EMO_EYES + '<path d="M14.5 26.5 C17 23 23 23 25.5 26.5"/>'),
-  neutral: emoSvg(EMO_HEAD + EMO_EYES + '<path d="M15.5 25 L24.5 25"/>'),
-  angry:   emoSvg(EMO_HEAD + EMO_EYES + '<path d="M13.5 13.5 L17 15.5"/><path d="M26.5 13.5 L23 15.5"/>'
-                  + '<path d="M14.5 26 C17 23.5 23 23.5 25.5 26"/>'),
+  happy:   emoSvg(EMO_EYES + '<path d="M8 23 C13 30 27 30 32 23"/>'),
+  sad:     emoSvg(EMO_EYES + '<path d="M8 29 C13 22.5 27 22.5 32 29"/>'),
+  neutral: emoSvg(EMO_EYES + '<path d="M10 26 L30 26"/>'),
+  angry:   emoSvg(EMO_EYES + '<path d="M8 8.5 L15 11.5"/><path d="M32 8.5 L25 11.5"/>'
+                  + '<path d="M9 28 C14 24 26 24 31 28"/>'),
 };
 function setEmotion(name) {
   const known = EMOTIONS[name] !== undefined;

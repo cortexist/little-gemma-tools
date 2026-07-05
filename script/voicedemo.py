@@ -19,6 +19,7 @@
 # 'T' transcript, 'R' reply clause, and piper's 'C'/'A'/'P' relayed through —
 # the page is the demux. Requires flask + pyopenssl; ffmpeg on PATH.
 import argparse
+import base64
 import os
 import queue
 import re
@@ -43,6 +44,50 @@ CHANNEL = re.compile(r"<\|channel>.*?(<channel\|>|$)", re.S)
 
 def speakable(raw):
     return TAG.sub("", CHANNEL.sub("", raw))
+
+
+# ---- visemes (--phonemes): the say-app experiment's Preston Blair set --------
+# script/lipsync/*.svg are the 12 mouth shapes; the IPA map below is ported
+# from the piper fork's say-app branch. espeak-ng also emits stress marks,
+# length marks and boundary tokens — those map to nothing and the mouth keeps
+# its previous shape.
+LIPSYNC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lipsync")
+REST_VISEME = "b_m_p"                     # closed mouth, start and end
+PHONEME_TO_VISEME = {
+    "a": "a_e_i", "æ": "a_e_i", "ʌ": "a_e_i", "ɐ": "a_e_i", "ɑ": "a_e_i",
+    "ɛ": "a_e_i", "ɜ": "a_e_i", "ə": "a_e_i", "e": "a_e_i",
+    "i": "ee", "ɪ": "ee",
+    "o": "o", "ɔ": "o", "ɒ": "o",
+    "u": "u", "ʊ": "u",
+    "b": "b_m_p", "m": "b_m_p", "p": "b_m_p",
+    "f": "f_v", "v": "f_v",
+    "θ": "th", "ð": "th",
+    "l": "l", "ɫ": "l",
+    "r": "r", "ɹ": "r", "ɾ": "r", "ʁ": "r",
+    "w": "q_w", "ʍ": "q_w",
+    "ʃ": "ch_sh_j", "ʒ": "ch_sh_j", "tʃ": "ch_sh_j", "dʒ": "ch_sh_j",
+    "c": "c_d_g_k_n_s_t_x_y_z", "d": "c_d_g_k_n_s_t_x_y_z",
+    "g": "c_d_g_k_n_s_t_x_y_z", "k": "c_d_g_k_n_s_t_x_y_z",
+    "n": "c_d_g_k_n_s_t_x_y_z", "s": "c_d_g_k_n_s_t_x_y_z",
+    "t": "c_d_g_k_n_s_t_x_y_z", "x": "c_d_g_k_n_s_t_x_y_z",
+    "j": "c_d_g_k_n_s_t_x_y_z", "z": "c_d_g_k_n_s_t_x_y_z",
+    "h": "c_d_g_k_n_s_t_x_y_z", "ŋ": "c_d_g_k_n_s_t_x_y_z",
+    "ʔ": "c_d_g_k_n_s_t_x_y_z",
+}
+
+
+def load_visemes():
+    """lipsync/*.svg as data URIs; an empty dict degrades to labels only."""
+    uris = {}
+    try:
+        for name in sorted(os.listdir(LIPSYNC_DIR)):
+            if name.endswith(".svg"):
+                with open(os.path.join(LIPSYNC_DIR, name), "rb") as f:
+                    uris[name[:-4]] = ("data:image/svg+xml;base64,"
+                                       + base64.b64encode(f.read()).decode())
+    except OSError:
+        pass
+    return uris
 
 
 # ---- the three companions -----------------------------------------------------
@@ -203,12 +248,33 @@ PAGE = """<!doctype html>
          margin:1.2rem 0 .2rem; }
   #you, #reply { min-height:1.5rem; }
   #ph  { color:#7fa1d4; font-family:ui-monospace, monospace; word-wrap:break-word; }
+  #mouthrow { display:flex; align-items:center; gap:1rem; margin-top:.4rem; }
+  #mouth { width:80px; height:80px; border-radius:.5rem; }
+  #vis  { color:#6b7280; font-family:ui-monospace, monospace; }
 </style>
 <h1>little-gemma — voice</h1>
 <button id="talk">enable microphone</button> <span id="status"></span>
 <div class="lbl">you said</div><div id="you"></div>
 <div class="lbl">reply</div><div id="reply"></div>
-<div class="lbl" id="phlbl" hidden>phonemes</div><div id="ph"></div>
+<div class="lbl" id="phlbl" hidden>phonemes</div>
+<div id="mouthrow" hidden><img id="mouth" alt="mouth"><span id="vis"></span></div>
+<div id="ph"></div>
+<script>
+// Viseme mouth (--phonemes): the say-app branch's Preston Blair shapes,
+// driven by the same schedule that paces the phoneme ticker.
+const VISEMES = {{ visemes|tojson }};
+const PH2VIS = {{ ph2vis|tojson }};
+const REST = {{ rest|tojson }};
+function visemeOf(p) {
+  if (!p) return null;
+  return PH2VIS[p] || PH2VIS[p[0]] || null;   // strip stress/length marks
+}
+function setMouth(v) {
+  if (!v || !VISEMES[v]) return;
+  document.getElementById('mouth').src = VISEMES[v];
+  document.getElementById('vis').textContent = v;
+}
+</script>
 <script>
 // Hands-free turn taking: one click arms the mic; an energy VAD (voicecat's
 // parameters: onset above threshold, HANG_MS of silence closes the turn)
@@ -298,7 +364,11 @@ function onframe(kind, payload) {
   if (kind === 'T') $('you').textContent = text();
   else if (kind === 'R') $('reply').textContent += (($('reply').textContent && ' ') || '') + text();
   else if (kind === 'C') { const m = /rate=(\\d+)/.exec(text()); if (m) rate = +m[1]; }
-  else if (kind === 'A') { $('phlbl').hidden = false; sched = text(); }
+  else if (kind === 'A') {
+    $('phlbl').hidden = false;
+    if (Object.keys(VISEMES).length) { $('mouthrow').hidden = false; setMouth(REST); }
+    sched = text();
+  }
   else if (kind === 'P') playPCM(payload);
 }
 
@@ -315,12 +385,16 @@ function playPCM(bytes) {
   src.start(cursor);
   if (sched) {                       // anchor this sentence's phonemes to its audio
     const t0 = cursor;
+    let end = 0;
     for (const line of sched.split('\\n')) {
       const [start, dur, ph] = line.split('\\t');
       if (ph === undefined) continue;
       const at = (t0 - ctx.currentTime + start / 1000) * 1000;
-      setTimeout(() => { $('ph').textContent += ph + ' '; }, Math.max(0, at));
+      end = Math.max(end, at + dur * 1);
+      const v = visemeOf(ph);
+      setTimeout(() => { $('ph').textContent += ph + ' '; setMouth(v); }, Math.max(0, at));
     }
+    setTimeout(() => setMouth(REST), end + 60);   // sentence over: mouth closes
     sched = null;
   }
   cursor += buf.duration;
@@ -333,7 +407,8 @@ pipe = None
 
 @app.route("/")
 def index():
-    return render_template_string(PAGE)
+    return render_template_string(PAGE, visemes=load_visemes(),
+                                  ph2vis=PHONEME_TO_VISEME, rest=REST_VISEME)
 
 
 @app.route("/converse", methods=["POST"])

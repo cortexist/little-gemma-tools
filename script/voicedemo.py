@@ -361,12 +361,11 @@ PAGE = """<!doctype html>
          margin:1.2rem 0 .2rem; }
   #you, #reply { min-height:1.5rem; }
   #ph  { color:#7fa1d4; font-family:ui-monospace, monospace; word-wrap:break-word; }
-  #mouthrow, #emorow { display:flex; align-items:center; gap:1rem; margin-top:.4rem; }
-  #mouthrow[hidden] { display:none; }   /* author display beats the hidden attr */
-  #mouth { width:80px; height:80px; border-radius:.5rem; background:#181c22; color:#d6d9de; }
-  #mouth svg { width:100%; height:100%; }
-  #emo { width:56px; height:56px; border-radius:.5rem; background:#181c22; color:#d6d9de; }
-  #emo svg { width:100%; height:100%; }
+  #emorow { display:flex; align-items:center; gap:1rem; margin-top:.4rem; }
+  #emo, #mouth { width:80px; height:80px; border-radius:.5rem; background:#181c22;
+                 color:#d6d9de; flex:none; }
+  #emo svg, #mouth svg { width:100%; height:100%; }
+  #mouth[hidden] { display:none; }      /* stays flex-hidden until phonemes flow */
   #vis, #emoname { color:#6b7280; font-family:ui-monospace, monospace; }
 </style>
 <h1>little-gemma — voice</h1>
@@ -374,9 +373,8 @@ PAGE = """<!doctype html>
 <div class="lbl">you said</div><div id="you"></div>
 <div class="lbl">reply</div><div id="reply"></div>
 <div class="lbl">emotion</div>
-<div id="emorow"><span id="emo"></span><span id="emoname"></span></div>
+<div id="emorow"><span id="emo"></span><span id="emoname"></span><span id="mouth" hidden></span><span id="vis"></span></div>
 <div class="lbl" id="phlbl" hidden>phonemes</div>
-<div id="mouthrow" hidden><span id="mouth"></span><span id="vis"></span></div>
 <div id="ph"></div>
 <script>
 // Viseme mouth (--phonemes): the say-app branch's Preston Blair shapes,
@@ -515,7 +513,7 @@ function onframe(kind, payload) {
   else if (kind === 'C') { const m = /rate=(\\d+)/.exec(text()); if (m) rate = +m[1]; }
   else if (kind === 'A') {
     $('phlbl').hidden = false;
-    if (Object.keys(VISEMES).length) { $('mouthrow').hidden = false; setMouth(REST); }
+    if (Object.keys(VISEMES).length) { $('mouth').hidden = false; setMouth(REST); }
     sched = text();
   }
   else if (kind === 'M') setEmotion(text());

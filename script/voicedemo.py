@@ -18,6 +18,17 @@
 # per turn, framed exactly like piper's mux ([kind][u32 len][payload]):
 # 'T' transcript, 'R' reply clause, and piper's 'C'/'A'/'P' relayed through —
 # the page is the demux. Requires flask + pyopenssl; ffmpeg on PATH.
+#
+# BARGE-IN (voicecat's, adapted for the browser): the mic stays open while
+# the reply plays — the browser's own echo cancellation (getUserMedia AEC)
+# removes the reply from the capture, so the VAD hears the user, not the
+# demo. Speech over the reply POSTs /barge: the runner gets the one-byte
+# LG_BARGE signal (it closes the turn; the cut-off reply stays in context),
+# piper is killed mid-clause, and the page stops its scheduled audio. The
+# next utterance opens with "(interrupting) " so the model knows why the
+# reply stopped. Needs a full-duplex `run -c` (little-gemma ≥ the select()
+# client) — with an older half-duplex client the barge byte queues behind
+# the reply and degrades to a no-op.
 import argparse
 import codecs
 import os
@@ -128,6 +139,7 @@ class Pipeline:
         self.piper_cfg = None                 # piper's startup 'C' frame payload
         self.sink = None                      # the active turn's frame queue
         self.last_pcm = 0.0
+        self.barged = False                   # next turn opens with the barge note
         self._piper_spawn()
 
     def _lg_spawn(self):
@@ -183,6 +195,28 @@ class Pipeline:
                     return
                 self._emit(b"P", data)
 
+    def barge(self):
+        """The user started talking over the reply. One bare LG_BARGE byte
+        (0x02, no newline — it is a signal, not a turn) rides the client's
+        stdin to the runner, which closes the turn at the next token; the
+        cut-off reply stays in the session's context. Killing piper drops
+        every queued clause with it — the next turn respawns the mouth.
+        Between turns the byte is ignored server-side, so racing the turn's
+        own end is harmless."""
+        if self.sink is None:
+            return False
+        self.barged = True
+        try:
+            self.lg.stdin.write(b"\x02")
+            self.lg.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            self.piper.kill()
+        except OSError:
+            pass
+        return True
+
     def transcribe(self, blob):
         """Browser audio (webm/ogg) -> 16 kHz wav -> whisper-cli -> text."""
         with tempfile.TemporaryDirectory() as td:
@@ -202,6 +236,9 @@ class Pipeline:
         """One turn: yields framed transcript, reply clauses, and audio."""
         with self.lock:
             text = self.transcribe(blob)
+            if text and self.barged:          # voicecat's --barge-note, fixed
+                text = "(interrupting) " + text
+                self.barged = False
             yield frame(b"T", text.encode("utf-8"))
             if not text:
                 return
@@ -423,16 +460,38 @@ window.addEventListener('DOMContentLoaded', () => setEmotion('neutral'));
 // parameters: onset above threshold, HANG_MS of silence closes the turn)
 // starts and stops the capture. While the mic is idle the recorder restarts
 // every PREROLL_MS so the utterance keeps up to that much lead-in — the
-// first syllable is never clipped. Listening gates off while the reply
-// audio plays (no echo cancellation: an open-air mic would hear the voice).
+// first syllable is never clipped.
+//
+// The mic stays open while the reply plays: the browser's echo cancellation
+// subtracts the reply from the capture, so what the VAD hears over playback
+// is the user. Barging still asks more of the signal than turn-taking does
+// (AEC leaves residue), so speech-over-reply needs the louder, longer onset
+// (BARGE_*) before it interrupts: POST /barge, stop the scheduled audio,
+// and record the interruption as the next turn.
 const VAD_THRESH = 0.02, HANG_MS = 700, ONSET_N = 3, PREROLL_MS = 300;
+const BARGE_THRESH = 0.04, BARGE_ONSET_N = 6;
 let rec = null, chunks = [], ctx = null, cursor = 0, rate = 22050, sched = null;
 let armed = false, talking = false, silentSince = 0, onsetRun = 0, busy = false;
+let playing = [], mouthTimers = [], deaf = false, bargeArmed = true;
 const $ = id => document.getElementById(id);
+
+function bargeNow() {
+  bargeArmed = false;
+  deaf = true;                              // drop the barged turn's late frames
+  fetch('barge', { method: 'POST' });
+  for (const s of playing) { try { s.stop(); } catch (e) {} }
+  playing = [];
+  for (const t of mouthTimers) clearTimeout(t);
+  mouthTimers = [];
+  cursor = 0; sched = null;
+  setMouth(REST);
+}
 
 $('talk').onclick = async () => {
   if (armed) { location.reload(); return; }              // disarm = reset
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+  });
   if (!ctx) ctx = new AudioContext();
   const src = ctx.createMediaStreamSource(stream);
   const an = ctx.createAnalyser();
@@ -451,19 +510,24 @@ $('talk').onclick = async () => {
   $('status').textContent = 'listening';
   let lastRestart = performance.now();
   setInterval(() => {
-    if (!armed || busy) return;
+    if (!armed) return;
     an.getFloatTimeDomainData(buf);
     let rms = 0;
     for (let i = 0; i < buf.length; i++) rms += buf[i] * buf[i];
     rms = Math.sqrt(rms / buf.length);
-    const speaking = ctx.currentTime < cursor + 0.3;     // reply still playing
+    // A turn is "replying" from its POST until its audio drains. Speech in
+    // the quiet is a normal onset; speech over the reply must clear the
+    // barge bar (AEC residue never should) and then interrupts.
+    const replying = busy || ctx.currentTime < cursor + 0.3;
+    const thresh = replying ? BARGE_THRESH : VAD_THRESH;
     const now = performance.now();
     if (!talking) {
-      if (!speaking && rms > VAD_THRESH && ++onsetRun >= ONSET_N) {
-        talking = true; silentSince = 0;
+      if (rms > thresh && ++onsetRun >= (replying ? BARGE_ONSET_N : ONSET_N)) {
+        if (replying) { if (!bargeArmed) return; bargeNow(); }
+        talking = true; silentSince = 0; onsetRun = 0;
         $('talk').classList.add('rec'); $('status').textContent = 'recording';
       } else {
-        if (rms <= VAD_THRESH) onsetRun = 0;
+        if (rms <= thresh) onsetRun = 0;
         if (now - lastRestart > PREROLL_MS) { rec.stop(); rec.onstop = restart; lastRestart = now; }
       }
     } else if (rms > VAD_THRESH) {
@@ -471,7 +535,7 @@ $('talk').onclick = async () => {
     } else if (!silentSince) {
       silentSince = now;
     } else if (now - silentSince > HANG_MS) {            // end of utterance
-      talking = false; onsetRun = 0; busy = true;
+      talking = false; onsetRun = 0;
       $('talk').classList.remove('rec');
       rec.onstop = () => { send(new Blob(chunks)); restart(); lastRestart = performance.now(); };
       rec.stop();
@@ -480,6 +544,8 @@ $('talk').onclick = async () => {
 };
 
 async function send(blob) {
+  while (busy) await new Promise(r => setTimeout(r, 40)); // a barged turn is still closing
+  busy = true;
   try { await send_(blob); } finally {      // never leave the VAD stuck on `busy`
     busy = false;
     $('status').textContent = armed ? 'listening' : '';
@@ -487,6 +553,7 @@ async function send(blob) {
 }
 
 async function send_(blob) {
+  deaf = false; bargeArmed = true; sched = null;
   $('you').textContent = '…'; $('reply').textContent = ''; $('ph').textContent = '';
   $('status').textContent = 'thinking';
   const res = await fetch('converse', { method: 'POST', body: blob });
@@ -522,6 +589,7 @@ function onframe(kind, payload) {
 }
 
 function playPCM(bytes) {
+  if (deaf) return;                  // a barged turn's late audio stays silent
   const n = bytes.length >> 1;
   if (!n) return;
   const i16 = new Int16Array(bytes.buffer, bytes.byteOffset, n);
@@ -530,6 +598,8 @@ function playPCM(bytes) {
   for (let i = 0; i < n; i++) ch[i] = i16[i] / 32768;
   const src = ctx.createBufferSource();
   src.buffer = buf; src.connect(ctx.destination);
+  playing.push(src);                 // barge must be able to stop what's scheduled
+  src.onended = () => { const i = playing.indexOf(src); if (i >= 0) playing.splice(i, 1); };
   cursor = Math.max(cursor, ctx.currentTime + 0.05);
   src.start(cursor);
   if (sched) {                       // anchor this sentence's phonemes to its audio
@@ -541,9 +611,9 @@ function playPCM(bytes) {
       const at = (t0 - ctx.currentTime + start / 1000) * 1000;
       end = Math.max(end, at + dur * 1);
       const v = visemeOf(ph);
-      setTimeout(() => { $('ph').textContent += ph + ' '; setMouth(v); }, Math.max(0, at));
+      mouthTimers.push(setTimeout(() => { $('ph').textContent += ph + ' '; setMouth(v); }, Math.max(0, at)));
     }
-    setTimeout(() => setMouth(REST), end + 60);   // sentence over: mouth closes
+    mouthTimers.push(setTimeout(() => setMouth(REST), end + 60));   // sentence over: mouth closes
     sched = null;
   }
   cursor += buf.duration;
@@ -564,6 +634,12 @@ def index():
 def converse():
     return Response(pipe.converse(request.get_data()),
                     mimetype="application/octet-stream")
+
+
+@app.route("/barge", methods=["POST"])
+def barge():
+    pipe.barge()
+    return "", 204
 
 
 def main():

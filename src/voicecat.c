@@ -79,6 +79,41 @@ static const char *g_barge_note = "(interrupting) ";
 // and the loop falls behind real time: keep commit_ms >= 3x the pass cost.
 static int g_commit_ms = 2500, g_hang_ms = 700, g_vad = 400, g_realtime = 0;
 
+static double now_sec(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+// ---- the listener (--listener) ------------------------------------------------
+// While the user is STILL SPEAKING, ask the model what it would do if the turn
+// ended right here: a 'P' probe frame rides after transcript commits and on
+// mid-utterance pauses (the classic backchannel-inviting spots), carrying a
+// steering suffix; the runner dry-runs the turn close on the live context,
+// decodes a few tokens, ROLLS THE CONTEXT BACK, and answers mid-turn with
+// "<|probe>text<probe|>\n" — probes never change the conversation. The
+// envelope is lifted out of the reply stream before stdout (the TTS never
+// sees it); the verdict's first word becomes an action line on stderr:
+//   nod    -> set_facial{"expression":"nodding"}
+//   mhmm   -> say_backchannel{"text":"mhmm"}    (a canned clip's cue, not TTS)
+//   answer -> logged as a listener end-point: the model believes the request
+//             is complete (a non-keyword verdict usually means it simply
+//             STARTED answering — the same signal, logged the same way)
+//   quiet  -> nothing
+// Policy — the suffix wording, the cadence, what the words mean — lives HERE
+// in the client; the engine only owns the dry-run + rollback mechanism. Note
+// a pause probe fires on COMMITTED text only: with per-invocation whisper the
+// unconfirmed tail lags the audio by up to commit-ms, so the model judges a
+// slightly stale transcript — the price of slow ears, not of the probe.
+static int g_listener = 0, g_probe_ms = 1500, g_probe_gen = 6;
+#define PROBE_PAUSE_MS 440               // mid-utterance pause that invites a cue
+static const char *g_probe_suffix =
+    "\n(brief listener check - I am still mid-request; reply with exactly one "
+    "lowercase word: nod if you follow me so far, mhmm to acknowledge me, "
+    "answer if my request is already complete, quiet otherwise)";
+static double g_probe_t0 = 0;            // last probe's send time (rate limit + latency)
+static int    g_probe_inflight = 0;
+
 // ---- the wire (mmcat's idioms; the socket here is NON-BLOCKING) --------------
 static int send_all(sock_t s, const void *buf, size_t n) {
     const char *p = buf;
@@ -229,6 +264,91 @@ static int turn_ends(const char *data, int n, int *state) {
     return hits;
 }
 
+static void send_probe(sock_t s) {
+    uint8_t hdr[LG_FRAME_HDR] = { LG_FRAME_MAGIC, LG_FRAME_PROBE };
+    uint16_t mg = (uint16_t)g_probe_gen;
+    uint32_t len = (uint32_t)strlen(g_probe_suffix);
+    memcpy(hdr + 2, &mg, 2);
+    memcpy(hdr + 6, &len, 4);
+    if (send_all(s, hdr, sizeof hdr) == 0 && send_all(s, g_probe_suffix, len) == 0) {
+        g_probe_inflight = 1;
+        g_probe_t0 = now_sec();
+    }
+}
+
+// A completed probe verdict: classify its first word, act on stderr (stdout
+// belongs to the reply/TTS).
+static void listener_verdict(const char *v) {
+    double lat = g_probe_t0 ? now_sec() - g_probe_t0 : 0;
+    g_probe_inflight = 0;
+    char w[32];
+    int n = 0;
+    for (const char *p = v; *p; p++) {                   // first word, lowercased
+        char c = *p;
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        if ((c >= 'a' && c <= 'z') || c == '-') { if (n < (int)sizeof w - 1) w[n++] = c; }
+        else if (n) break;
+    }
+    w[n] = 0;
+    int nod  = !strcmp(w, "nod") || !strcmp(w, "nodding");
+    int mhmm = !strcmp(w, "mhmm") || !strcmp(w, "mm-hmm") || !strcmp(w, "mmhmm") ||
+               !strcmp(w, "uh-huh") || !strcmp(w, "hmm") || !strcmp(w, "hm");
+    int quiet = !v[0] || !strcmp(w, "quiet") || !strcmp(w, "none") ||
+                !strcmp(w, "nothing") || !strcmp(w, "wait") || !strcmp(w, "silence");
+    if (nod)  fprintf(stderr, "set_facial{\"expression\":\"nodding\"}\n");
+    if (mhmm) fprintf(stderr, "say_backchannel{\"text\":\"mhmm\"}\n");
+    if (!nod && !mhmm && !quiet)                         // 'answer', or it started answering
+        fprintf(stderr, "voicecat: listener end-point (the model would answer now)\n");
+    fprintf(stderr, "voicecat: probe %.2fs -> '%s'\n", lat, v);
+}
+
+// Incremental "<|probe>verdict<probe|>\n" extractor: envelope bytes never
+// reach `out`, completed verdicts go to listener_verdict. A held partial
+// marker carries across reads; neither marker contains '<' past its first
+// byte, so flush-then-rematch-current is exact.
+static struct { int m, cap, cm, vn; char v[512]; } g_pf;
+static int pf_feed(const char *in, int n, char *out) {
+    static const char PO[] = "<|probe>", PC[] = "<probe|>\n";
+    int on = 0;
+    for (int i = 0; i < n; i++) {
+        char c = in[i];
+        if (!g_pf.cap) {
+            if (c == PO[g_pf.m]) {
+                if (!PO[++g_pf.m]) { g_pf.m = 0; g_pf.cap = 1; g_pf.cm = 0; g_pf.vn = 0; }
+            } else {
+                for (int j = 0; j < g_pf.m; j++) out[on++] = PO[j];
+                g_pf.m = c == PO[0] ? 1 : 0;
+                if (!g_pf.m) out[on++] = c;
+            }
+        } else {
+            if (c == PC[g_pf.cm]) {
+                if (!PC[++g_pf.cm]) {
+                    g_pf.v[g_pf.vn] = 0;
+                    listener_verdict(g_pf.v);
+                    g_pf.cap = 0; g_pf.cm = 0; g_pf.vn = 0;
+                }
+            } else {
+                for (int j = 0; j < g_pf.cm && g_pf.vn < (int)sizeof g_pf.v - 1; j++) g_pf.v[g_pf.vn++] = PC[j];
+                g_pf.cm = c == PC[0] ? 1 : 0;
+                if (!g_pf.cm && g_pf.vn < (int)sizeof g_pf.v - 1) g_pf.v[g_pf.vn++] = c;
+            }
+        }
+    }
+    return on;
+}
+
+// One received chunk: probe envelopes lifted out, the rest to stdout and the
+// turn matcher. A finished turn also clears the probe-inflight latch — the
+// socket is FIFO, so any probe answer would have arrived before the turn end.
+static void deliver(const char *in, int k, int *pending, int *tstate) {
+    char out[4096 + 16];
+    int on = pf_feed(in, k, out);
+    fwrite(out, 1, (size_t)on, stdout);
+    int done = turn_ends(out, on, tstate);
+    while (done-- > 0) { (*pending)--; putchar('\n'); g_probe_inflight = 0; }
+    fflush(stdout);
+}
+
 // Byte offset just past word `k` (0 = start of word 1).
 static size_t after_word(const char *s, int k) {
     const char *p = s;
@@ -267,6 +387,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--commit-ms") && i + 1 < argc)     g_commit_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hang-ms") && i + 1 < argc)       g_hang_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--vad-level") && i + 1 < argc)     g_vad = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--listener"))                      g_listener = 1;
+        else if (!strcmp(argv[i], "--probe-ms") && i + 1 < argc)      g_probe_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--probe-gen") && i + 1 < argc)     g_probe_gen = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--probe-suffix") && i + 1 < argc)  g_probe_suffix = argv[++i];
         else if (!spath)                                              spath = argv[i];
         else { fprintf(stderr, "voicecat: unknown argument %s\n", argv[i]); return 1; }
     }
@@ -275,10 +399,13 @@ int main(int argc, char **argv) {
             "usage: voicecat <socket> [--mic FFMPEG_INPUT | --stdin-pcm [--realtime]]\n"
             "                [--whisper-model FILE] [--whisper-bin PATH] [--barge-note TEXT]\n"
             "                [--commit-ms N=2500] [--hang-ms N=700] [--vad-level N=400]\n"
+            "                [--listener [--probe-ms N=1500] [--probe-gen N=6] [--probe-suffix TEXT]]\n"
             "  --mic        ffmpeg input spec (default \"-f alsa -i default\" on Linux)\n"
             "  --stdin-pcm  mono 16 kHz s16 PCM on stdin instead of a mic\n"
             "  --realtime   pace stdin PCM at wall-clock rate, as a live mic would deliver it\n"
             "               (replay recordings realistically; a real mic paces itself)\n"
+            "  --listener   probe the model while the user speaks (after commits and on\n"
+            "               pauses): nod/backchannel/end-point actions on stderr; needs whisper\n"
             "  no whisper model -> whole utterances as native audio spans (vision-free sessions only)\n");
         return 1;
     }
@@ -288,6 +415,11 @@ int main(int argc, char **argv) {
     if (!whisper)
         fprintf(stderr, "voicecat: no whisper model — native audio spans "
                         "(the model's ears work only while the session is vision-free)\n");
+    if (g_listener && !whisper) {
+        fprintf(stderr, "voicecat: --listener needs streaming transcripts (a whisper model) — "
+                        "a native-span turn has no open text to probe; listener off\n");
+        g_listener = 0;
+    }
 
     // audio source
     FILE *src;
@@ -332,7 +464,7 @@ int main(int argc, char **argv) {
     char ptail[400] = "";                            // trimmed text tail -> whisper --prompt
     size_t last_pass = 0;                            // ub_n at the previous whisper pass
     size_t last_voice = 0;                           // ub_n at the last voiced frame
-    int in_utt = 0, onset = 0, sil_ms = 0, turn_open = 0, barged = 0;
+    int in_utt = 0, onset = 0, sil_ms = 0, turn_open = 0, barged = 0, pause_probed = 0;
     int pending = 0, barge_armed = 1, tstate = 0;    // replies awaited; one barge per utterance
     char rbuf[4096];
     double rt0 = 0; long rtn = 0;                    // --realtime deadline pacing
@@ -356,10 +488,7 @@ int main(int argc, char **argv) {
         for (;;) {
             int k = (int)recv(s, rbuf, sizeof rbuf, 0);
             if (k <= 0) break;
-            fwrite(rbuf, 1, (size_t)k, stdout);
-            int done = turn_ends(rbuf, k, &tstate);
-            while (done-- > 0) { pending--; putchar('\n'); }
-            fflush(stdout);
+            deliver(rbuf, k, &pending, &tstate);
         }
 
         if (!eof) {
@@ -384,7 +513,7 @@ int main(int argc, char **argv) {
                     if (ub_cap < pre + FR_SAMP) { ub_cap = 1 << 20; ub = realloc(ub, ub_cap * 2); }
                     memcpy(ub, ring + (PREROLL - ring_n) * FR_SAMP, pre * 2);
                     ub_n = pre;
-                    in_utt = 1; sil_ms = 0; onset = 0;
+                    in_utt = 1; sil_ms = 0; onset = 0; pause_probed = 0;
                     committed = 0; trimmed = 0; ptail[0] = 0;
                     prev[0] = 0; last_pass = 0; last_voice = ub_n; turn_open = 0;
                 }
@@ -392,7 +521,15 @@ int main(int argc, char **argv) {
                 if (ub_n + FR_SAMP > ub_cap) { ub_cap *= 2; ub = realloc(ub, ub_cap * 2); }
                 memcpy(ub + ub_n, frame, sizeof frame); ub_n += FR_SAMP;
                 sil_ms = voiced ? 0 : sil_ms + FR_MS;
-                if (voiced) last_voice = ub_n;
+                if (voiced) { last_voice = ub_n; pause_probed = 0; }
+                // a beat in the speech — the classic spot for a listener cue:
+                // probe once per pause, on the committed context, rate-limited
+                if (g_listener && turn_open && !voiced && sil_ms >= PROBE_PAUSE_MS && !pause_probed &&
+                    pending == 0 && !g_probe_inflight &&
+                    now_sec() - g_probe_t0 >= g_probe_ms / 1000.0) {
+                    send_probe(s);
+                    pause_probed = 1;
+                }
                 // mid-utterance whisper pass over the (trimmed) window: commit
                 // words two consecutive passes agree on, then trim the window
                 // past fully-confirmed segments — pass cost tracks the tail.
@@ -417,6 +554,11 @@ int main(int argc, char **argv) {
                             turn_open = 1;
                             fprintf(stderr, "voicecat: +%d words committed\n", agree - local);
                             committed += agree - local;
+                            // fresh words just landed in the open turn: a
+                            // natural moment to ask the listener for a cue
+                            if (g_listener && pending == 0 && !g_probe_inflight &&
+                                now_sec() - g_probe_t0 >= g_probe_ms / 1000.0)
+                                send_probe(s);
                         }
                         strcpy(prev, cur);
                         size_t trim = 0; int twords = 0;             // whole segments, all confirmed
@@ -489,12 +631,8 @@ int main(int argc, char **argv) {
         if (eof) {
             while (pending > 0) {                        // drain the last replies, then leave
                 int k = (int)recv(s, rbuf, sizeof rbuf, 0);
-                if (k > 0) {
-                    fwrite(rbuf, 1, (size_t)k, stdout);
-                    int done = turn_ends(rbuf, k, &tstate);
-                    while (done-- > 0) { pending--; putchar('\n'); }
-                    fflush(stdout);
-                } else if (k == 0) break;
+                if (k > 0) deliver(rbuf, k, &pending, &tstate);
+                else if (k == 0) break;
                 else if (wouldblock()) msleep(10);
                 else break;
             }

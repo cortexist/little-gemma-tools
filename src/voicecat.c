@@ -114,8 +114,8 @@ static int g_listener = 0, g_probe_ms = 1500, g_probe_gen = 6;
 static const char *g_probe_suffix =
     "\n(brief listener check - I am still mid-request, keep listening; emit "
     "exactly one backchannel tag: [[nod]] if you follow me so far, [[mhmm]] to "
-    "acknowledge me, [[answer]] if my request is already complete, [[quiet]] "
-    "otherwise)";
+    "acknowledge me, [[shake]] if I have something wrong, [[answer]] if my "
+    "request is already complete, [[quiet]] otherwise)";
 static double g_probe_t0 = 0;            // last probe's send time (rate limit + latency)
 static int    g_probe_inflight = 0;
 
@@ -298,13 +298,15 @@ static void listener_verdict(const char *v) {
     }
     w[n] = 0;
     int nod  = !strcmp(w, "nod") || !strcmp(w, "nodding");
+    int shake = !strcmp(w, "shake") || !strcmp(w, "no");
     int mhmm = !strcmp(w, "mhmm") || !strcmp(w, "mm-hmm") || !strcmp(w, "mmhmm") ||
                !strcmp(w, "uh-huh") || !strcmp(w, "hmm") || !strcmp(w, "hm");
     int quiet = !v[0] || !strcmp(w, "quiet") || !strcmp(w, "none") ||
                 !strcmp(w, "nothing") || !strcmp(w, "wait") || !strcmp(w, "silence");
-    if (nod)  fprintf(stderr, "set_facial{\"expression\":\"nodding\"}\n");
-    if (mhmm) fprintf(stderr, "say_backchannel{\"text\":\"mhmm\"}\n");
-    if (!nod && !mhmm && !quiet)                         // 'answer', or it started answering
+    if (nod)   fprintf(stderr, "set_facial{\"expression\":\"nodding\"}\n");
+    if (shake) fprintf(stderr, "set_facial{\"expression\":\"shaking\"}\n");
+    if (mhmm)  fprintf(stderr, "say_backchannel{\"text\":\"mhmm\"}\n");
+    if (!nod && !shake && !mhmm && !quiet)               // 'answer', or it started answering
         fprintf(stderr, "voicecat: listener end-point (the model would answer now)\n");
     fprintf(stderr, "voicecat: probe %.2fs -> '%s'\n", lat, v);
 }

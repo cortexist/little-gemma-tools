@@ -223,8 +223,9 @@ class Pipeline:
     # transcription, which this demo's whole-blob whisper does not do yet;
     # voicecat --listener is the streaming sibling.) Kept single-line and
     # newline-free: the -c client counts stdin newlines as turns owed.
-    PROBE_SUFFIX = ("(quick listener check - emit exactly one tag: [[nod]] if my "
-                    "request is clear to you, [[quiet]] if not)")
+    PROBE_SUFFIX = (" (quick listener check - emit exactly one tag: [[nod]] if my "
+                    "request is clear and you can help, [[shake]] if you would "
+                    "have to decline or correct me, [[quiet]] if unsure)")
 
     def _send_frame(self, kind, w, payload):
         """Raw runner frame bytes down the -c client's stdin — the same ride
@@ -450,12 +451,14 @@ PAGE = """<!doctype html>
   #emo, #mouth { width:80px; height:80px; border-radius:.5rem; background:#181c22;
                  color:#d6d9de; flex:none; }
   #emo svg, #mouth svg { width:100%; height:100%; }
-  /* The nod ('N' frames): the SAME emotion face pitches about the chin in 3D —
-     a perspective rotateX reads as a head gesture where a translate would read
-     as a bouncing icon. Two dips for a nod, one shallow dip for an mhmm. */
+  /* Listener gestures ('N' frames): the SAME emotion face moves in 3D — a
+     perspective rotation reads as a head gesture where a translate would read
+     as a bouncing icon. Nod = pitch about the chin (two dips; one shallow dip
+     for an mhmm); shake = yaw about the vertical axis, side to side. */
   #emo { transform-origin: 50% 78%; }
   #emo.nod     { animation: nod .9s ease-in-out; }
   #emo.nodsoft { animation: nodsoft .7s ease-in-out; }
+  #emo.shake   { animation: shake .8s ease-in-out; }
   @keyframes nod {
     0%, 100% { transform: perspective(220px) rotateX(0deg); }
     22%      { transform: perspective(220px) rotateX(-17deg); }
@@ -465,6 +468,12 @@ PAGE = """<!doctype html>
   @keyframes nodsoft {
     0%, 100% { transform: perspective(220px) rotateX(0deg); }
     40%      { transform: perspective(220px) rotateX(-9deg); }
+  }
+  @keyframes shake {
+    0%, 100% { transform: perspective(220px) rotateY(0deg); }
+    20%      { transform: perspective(220px) rotateY(16deg); }
+    45%      { transform: perspective(220px) rotateY(-14deg); }
+    70%      { transform: perspective(220px) rotateY(9deg); }
   }
   #mouth[hidden] { display:none; }      /* stays flex-hidden until phonemes flow */
   #vis, #emoname { color:#6b7280; font-family:ui-monospace, monospace; }
@@ -522,8 +531,9 @@ function setEmotion(name) {
 // class (with a reflow between) restarts the animation on back-to-back cues.
 function nod(cue) {
   const el = document.getElementById('emo');
-  const cls = (cue === 'mhmm' || cue === 'hm' || cue === 'hmm') ? 'nodsoft' : 'nod';
-  el.classList.remove('nod', 'nodsoft');
+  const cls = (cue === 'shake' || cue === 'no') ? 'shake'
+            : (cue === 'mhmm' || cue === 'hm' || cue === 'hmm') ? 'nodsoft' : 'nod';
+  el.classList.remove('nod', 'nodsoft', 'shake');
   void el.offsetWidth;
   el.classList.add(cls);
 }

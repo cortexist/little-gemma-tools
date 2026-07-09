@@ -365,8 +365,15 @@ class Pipeline:
                             flush()
                         clause[0] += c
 
+                    def emotion(value):
+                        """[[emotion:X]] — the house inline tag; rendered as the
+                        set_voice control line control() already knows how to
+                        route (piper switches, the browser gets its M frame)."""
+                        control('<|tool_call>call:set_voice{speaker_id:<|"|>%s<|"|>}<tool_call|>' % value)
+
                     tag, thought, cn = "", False, 0
                     span, tcall, tcn = "", False, 0
+                    tsp, brk, pb = "", False, False    # a [[key:value]] inline tag
                     CLOSE, TCLOSE = "<channel|>", "<tool_call|>"
                     utf8 = codecs.getincrementaldecoder("utf-8")(errors="replace")
                     raw = b""
@@ -402,6 +409,28 @@ class Pipeline:
                                 for t in tag:
                                     add(t)
                                 tag = ""
+                            if brk:                      # a [[...]] inline tag
+                                if c == "]" and tsp.endswith("]"):
+                                    key = tsp[:-1]
+                                    if key.startswith("emotion:") and key[8:]:
+                                        emotion(key[8:])
+                                    brk, tsp = False, "" # unknown tags drop whole
+                                    continue
+                                if len(tsp) < 64:
+                                    tsp += c
+                                    continue
+                                for t in "[[" + tsp:     # overflow: literal text
+                                    add(t)
+                                brk, tsp = False, ""
+                            if pb:
+                                pb = False
+                                if c == "[":
+                                    brk, tsp = True, ""
+                                    continue
+                                add("[")
+                            if c == "[":
+                                pb = True
+                                continue
                             if c == "<":
                                 tag = "<"
                                 continue

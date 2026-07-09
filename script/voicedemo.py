@@ -615,7 +615,7 @@ function bargeNow() {
   let heard = '';
   if (audioT0 && cursor > audioT0) {
     const played = Math.max(0, Math.min(ctx.currentTime, cursor) - audioT0);
-    const words = $('reply').textContent.trim().split(/\s+/).filter(w => w);
+    const words = $('reply').textContent.trim().split(/\\s+/).filter(w => w);
     const n = Math.round(words.length * Math.min(1, played / (cursor - audioT0)));
     heard = words.slice(Math.max(0, n - 8), n).join(' ');
   }

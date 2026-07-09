@@ -217,6 +217,39 @@ class Pipeline:
             pass
         return True
 
+    # The demo's listener probe (--listener): one check at end-of-utterance —
+    # "is the request clear?" — so the face acknowledges DURING the think-gap
+    # before the reply's audio starts. (Mid-utterance nods need streaming
+    # transcription, which this demo's whole-blob whisper does not do yet;
+    # voicecat --listener is the streaming sibling.) Kept single-line and
+    # newline-free: the -c client counts stdin newlines as turns owed.
+    PROBE_SUFFIX = ("(quick listener check - emit exactly one tag: [[nod]] if my "
+                    "request is clear to you, [[quiet]] if not)")
+
+    def _send_frame(self, kind, w, payload):
+        """Raw runner frame bytes down the -c client's stdin — the same ride
+        the barge byte takes; the POSIX client forwards them verbatim."""
+        self.lg.stdin.write(struct.pack("<BcHHI", 1, kind, w, 0, len(payload)) + payload)
+        self.lg.stdin.flush()
+
+    def probe(self, gen=8):
+        """Send a 'P' probe against the open turn, read the mid-turn
+        "<|probe>verdict<probe|>" envelope back, return the tag's word (None
+        on any trouble). The runner rolls the probe back — the real reply,
+        which follows the turn close, is byte-identical either way."""
+        try:
+            self._send_frame(b"P", gen, self.PROBE_SUFFIX.encode("utf-8"))
+        except (BrokenPipeError, OSError):
+            return None
+        buf = b""
+        while not buf.endswith(b"<probe|>\n") and len(buf) < 4096:
+            b = self.lg.stdout.read(1)
+            if not b:
+                return None
+            buf += b
+        m = re.search(rb"\[\[([a-z-]+)\]\]", buf) or re.search(rb"<\|probe>\s*([A-Za-z-]+)", buf)
+        return m.group(1).decode("utf-8", "replace").lower() if m else None
+
     def transcribe(self, blob):
         """Browser audio (webm/ogg) -> 16 kHz wav -> whisper-cli -> text."""
         with tempfile.TemporaryDirectory() as td:
@@ -242,6 +275,21 @@ class Pipeline:
             yield frame(b"T", text.encode("utf-8"))
             if not text:
                 return
+
+            # --listener: open the turn as a 'T' frame so the probe has the
+            # request in context; the reply thread then closes it with a bare
+            # newline (the runner assembles the turn from both, exactly like
+            # streamed dictation). The face nods before the reply computes.
+            line = text
+            if self.args.listener:
+                try:
+                    self._send_frame(b"T", 0, text.encode("utf-8"))
+                    line = ""
+                    cue = self.probe()
+                    if cue and cue != "quiet":
+                        yield frame(b"N", cue.encode("utf-8"))
+                except (BrokenPipeError, OSError):
+                    pass          # the reply thread's respawn path takes over
 
             q = queue.Queue()
             self.sink = q
@@ -274,7 +322,7 @@ class Pipeline:
                     try:
                         if self.lg.poll() is not None:
                             raise BrokenPipeError
-                        self.lg.stdin.write(text.encode("utf-8") + b"\n")
+                        self.lg.stdin.write(line.encode("utf-8") + b"\n")
                         self.lg.stdin.flush()
                     except (BrokenPipeError, OSError):
                         speak("The voice session restarted. Please ask again.")
@@ -402,6 +450,22 @@ PAGE = """<!doctype html>
   #emo, #mouth { width:80px; height:80px; border-radius:.5rem; background:#181c22;
                  color:#d6d9de; flex:none; }
   #emo svg, #mouth svg { width:100%; height:100%; }
+  /* The nod ('N' frames): the SAME emotion face pitches about the chin in 3D —
+     a perspective rotateX reads as a head gesture where a translate would read
+     as a bouncing icon. Two dips for a nod, one shallow dip for an mhmm. */
+  #emo { transform-origin: 50% 78%; }
+  #emo.nod     { animation: nod .9s ease-in-out; }
+  #emo.nodsoft { animation: nodsoft .7s ease-in-out; }
+  @keyframes nod {
+    0%, 100% { transform: perspective(220px) rotateX(0deg); }
+    22%      { transform: perspective(220px) rotateX(-17deg); }
+    45%      { transform: perspective(220px) rotateX(-4deg); }
+    68%      { transform: perspective(220px) rotateX(-13deg); }
+  }
+  @keyframes nodsoft {
+    0%, 100% { transform: perspective(220px) rotateX(0deg); }
+    40%      { transform: perspective(220px) rotateX(-9deg); }
+  }
   #mouth[hidden] { display:none; }      /* stays flex-hidden until phonemes flow */
   #vis, #emoname { color:#6b7280; font-family:ui-monospace, monospace; }
 </style>
@@ -452,6 +516,16 @@ function setEmotion(name) {
   const known = EMOTIONS[name] !== undefined;
   document.getElementById('emo').innerHTML = EMOTIONS[known ? name : 'neutral'];
   document.getElementById('emoname').textContent = known ? name : 'neutral';
+}
+// A listener cue ('N' frame): animate the CURRENT face — whatever emotion it
+// wears keeps wearing it, the head just moves. Removing and re-adding the
+// class (with a reflow between) restarts the animation on back-to-back cues.
+function nod(cue) {
+  const el = document.getElementById('emo');
+  const cls = (cue === 'mhmm' || cue === 'hm' || cue === 'hmm') ? 'nodsoft' : 'nod';
+  el.classList.remove('nod', 'nodsoft');
+  void el.offsetWidth;
+  el.classList.add(cls);
 }
 window.addEventListener('DOMContentLoaded', () => setEmotion('neutral'));
 </script>
@@ -585,6 +659,7 @@ function onframe(kind, payload) {
     sched = text();
   }
   else if (kind === 'M') setEmotion(text());
+  else if (kind === 'N') nod(text());
   else if (kind === 'P') playPCM(payload);
 }
 
@@ -655,6 +730,9 @@ def main():
     p.add_argument("--phonemes", action="store_true",
                    help="show phoneme timings (needs the piper fork's `phoneme-stream` "
                    "branch and an alignment-enabled voice — see README)")
+    p.add_argument("--listener", action="store_true",
+                   help="probe the model once per utterance for a [[nod]] — the face "
+                   "acknowledges during the think-gap (needs a duplex-branch serve)")
     p.add_argument("--rate", type=int, default=22050, help="voice sample rate")
     p.add_argument("--port", type=int, default=8443)
     p.add_argument("--http", action="store_true",

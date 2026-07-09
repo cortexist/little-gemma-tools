@@ -134,8 +134,9 @@ static int    g_probe_inflight = 0;
 static int g_idle_compress = 900;        // seconds of quiet that trigger it (0 = off)
 static const char *g_compress_ask =
     "(session maintenance) Summarize our conversation so far in under 120 "
-    "words - the facts, names, preferences, and any unfinished business. "
-    "Reply with only the summary.";
+    "words - the facts, names, preferences, any unfinished business, and a "
+    "one-line description of anything you were shown or heard beyond my "
+    "words. Reply with only the summary.";
 
 // ---- the wire (mmcat's idioms; the socket here is NON-BLOCKING) --------------
 static int send_all(sock_t s, const void *buf, size_t n) {

@@ -138,6 +138,40 @@ static const char *g_compress_ask =
     "one-line description of anything you were shown or heard beyond my "
     "words. Reply with only the summary.";
 
+// ---- time awareness (--clock) ---------------------------------------------------
+// GPT-Live-style temporal awareness as plain turn text — the engine never
+// knows. Every turn opens with the real clock, "[14:32] " (weekday on the
+// session's first), and once the quiet since the last exchange passes the
+// threshold, the client does the arithmetic the model is bad at and appends
+// "(27 minutes of quiet pass) ". MEASURED on E4B: a plain bracket reads back
+// correctly when asked the time but carries no sense of gap length; the gap
+// parenthetical fixes elapsed judgments and return-greetings but corrupts an
+// absolute read in that same turn (the model computes instead of reading) —
+// hence plain always, annotation only past the threshold, both tunable.
+// docs/voice-sys.txt teaches the model to use the clock silently.
+static int    g_clock = 300;             // gap-annotation threshold, s (0 = no markers)
+static int    g_first_turn = 1;
+static double g_last_close = 0;          // when the previous exchange ended
+
+static const char *turn_clock(void) {
+    static char buf[96];
+    if (g_clock <= 0) return "";
+    time_t t = time(NULL);
+    size_t n = strftime(buf, sizeof buf, g_first_turn ? "[%a %H:%M] " : "[%H:%M] ", localtime(&t));
+    double gap = g_last_close > 0 ? now_sec() - g_last_close : 0;
+    if (!g_first_turn && gap >= (double)g_clock) {
+        int mins = (int)(gap / 60.0 + 0.5);
+        if (mins < 1) mins = 1;
+        if (mins >= 60)
+            snprintf(buf + n, sizeof buf - n, "(%d hour%s and %d minute%s of quiet pass) ",
+                     mins / 60, mins / 60 == 1 ? "" : "s", mins % 60, mins % 60 == 1 ? "" : "s");
+        else
+            snprintf(buf + n, sizeof buf - n, "(%d minute%s of quiet pass) ", mins, mins == 1 ? "" : "s");
+    }
+    g_first_turn = 0;
+    return buf;
+}
+
 // ---- the wire (mmcat's idioms; the socket here is NON-BLOCKING) --------------
 static int send_all(sock_t s, const void *buf, size_t n) {
     const char *p = buf;
@@ -446,7 +480,12 @@ static sock_t compress_session(sock_t s, const char *spath) {
     sock_t ns = sock_connect(spath);
     if (ns == INVALID_SOCKET) { fprintf(stderr, "voicecat: reconnect failed after compress\n"); exit(1); }
     char seed[4608];
-    int sl = snprintf(seed, sizeof seed, "(memory of our conversation before this pause: %s) ", dig);
+    char when[48] = "";
+    if (g_clock > 0) {                  // the fresh session opens knowing the hour
+        time_t t = time(NULL);
+        strftime(when, sizeof when, "it is now %a %H:%M; ", localtime(&t));
+    }
+    int sl = snprintf(seed, sizeof seed, "(%smemory of our conversation before this pause: %s) ", when, dig);
     if (sl >= (int)sizeof seed) sl = (int)sizeof seed - 1;
     send_frame(ns, LG_FRAME_TEXT, seed, (uint32_t)sl);
     fprintf(stderr, "voicecat: session compressed — %d-char digest seated in a fresh context\n", (int)dn);
@@ -496,6 +535,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--probe-gen") && i + 1 < argc)     g_probe_gen = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--probe-suffix") && i + 1 < argc)  g_probe_suffix = argv[++i];
         else if (!strcmp(argv[i], "--idle-compress") && i + 1 < argc) g_idle_compress = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--clock") && i + 1 < argc)         g_clock = atoi(argv[++i]);
         else if (!spath)                                              spath = argv[i];
         else { fprintf(stderr, "voicecat: unknown argument %s\n", argv[i]); return 1; }
     }
@@ -513,6 +553,9 @@ int main(int argc, char **argv) {
             "               pauses): nod/backchannel/end-point actions on stderr; needs whisper\n"
             "  --idle-compress N   after N seconds of quiet, digest the conversation into a\n"
             "               fresh session (default 900; 0 = off) — long sessions stay young\n"
+            "  --clock N    open every turn with the real time, \"[14:32] \"; a quiet longer\n"
+            "               than N seconds also gets \"(27 minutes of quiet pass)\" so the\n"
+            "               model senses the gap (default 300; 0 = no time markers)\n"
             "  no whisper model -> whole utterances as native audio spans (vision-free sessions only)\n");
         return 1;
     }
@@ -656,7 +699,8 @@ int main(int argc, char **argv) {
                             size_t a = after_word(cur, local), b = after_word(cur, agree);
                             while (cur[a] == ' ') a++;
                             char piece[8192];
-                            int m = snprintf(piece, sizeof piece, "%s%.*s ",
+                            int m = snprintf(piece, sizeof piece, "%s%s%.*s ",
+                                             !turn_open ? turn_clock() : "",
                                              !turn_open && barged ? g_barge_note : "", (int)(b - a), cur + a);
                             if (m > (int)sizeof piece - 1) m = (int)sizeof piece - 1;
                             send_frame(s, LG_FRAME_TEXT, piece, (uint32_t)m);
@@ -716,24 +760,28 @@ int main(int argc, char **argv) {
                 if (ok) {
                     size_t a = after_word(cur, committed - trimmed);
                     while (cur[a] == ' ') a++;
-                    snprintf(line, sizeof line, "%s%s", !turn_open && barged ? g_barge_note : "", cur + a);
+                    if (turn_open || cur[a] || barged)   // never a clock-only turn
+                        snprintf(line, sizeof line, "%s%s%s", !turn_open ? turn_clock() : "",
+                                 !turn_open && barged ? g_barge_note : "", cur + a);
                 }
                 if (turn_open || line[0]) {              // silence/false trigger sends nothing
                     size_t L = strlen(line);
                     if (L > sizeof line - 2) L = sizeof line - 2;
                     line[L] = '\n'; line[L + 1] = 0;
                     send_all(s, line, L + 1);
-                    pending++; barge_armed = 1; barged = 0; dirty = 1;
+                    pending++; barge_armed = 1; barged = 0; dirty = 1; g_last_close = now_sec();
                     fprintf(stderr, "voicecat: turn closed (%d+ words)\n", committed);
                 }
             } else if (ub_n >= LG_RATE / 2) {            // native span; drop sub-0.5s blips
                 size_t pad = (LG_FRAME - ub_n % LG_FRAME) % LG_FRAME;
                 if (ub_n + pad > ub_cap) { ub_cap = ub_n + pad; ub = realloc(ub, ub_cap * 2); }
                 memset(ub + ub_n, 0, pad * 2);
+                const char *ck = turn_clock();
+                if (*ck) send_frame(s, LG_FRAME_TEXT, ck, (uint32_t)strlen(ck));
                 if (barged) { send_frame(s, LG_FRAME_TEXT, g_barge_note, (uint32_t)strlen(g_barge_note)); barged = 0; }
                 send_frame(s, LG_FRAME_AUDIO, ub, (uint32_t)((ub_n + pad) * 2));
                 send_all(s, "\n", 1);
-                pending++; barge_armed = 1; dirty = 1;
+                pending++; barge_armed = 1; dirty = 1; g_last_close = now_sec();
                 fprintf(stderr, "voicecat: turn closed (%.1fs audio)\n", (double)ub_n / LG_RATE);
             }
         }

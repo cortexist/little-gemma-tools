@@ -142,7 +142,28 @@ class Pipeline:
         self.barged = False                   # next turn opens with the barge note
         self.barge_heard = ""                 # ...and, when the browser knows it,
                                               # the last words that actually SOUNDED
+        self.first_turn = True                # --clock: weekday on the first marker
+        self.last_close = 0.0                 # when the previous exchange ended
         self._piper_spawn()
+
+    def turn_clock(self):
+        """GPT-Live-style time awareness as plain turn text (voicecat's --clock,
+        mirrored): '[14:32] ' every turn, weekday on the first, and a quiet past
+        the threshold gets the arithmetic done for the model — '(27 minutes of
+        quiet pass) '. Measured on E4B: the plain bracket reads back correctly
+        when asked the time; the gap parenthetical fixes elapsed judgments and
+        return-greetings (but not both at once — hence the threshold)."""
+        if self.args.clock <= 0:
+            return ""
+        mark = time.strftime("[%a %H:%M] " if self.first_turn else "[%H:%M] ")
+        gap = time.time() - self.last_close if self.last_close else 0
+        self.first_turn = False
+        if gap >= self.args.clock:
+            m = max(1, int(gap / 60 + 0.5))
+            s = lambda n: "" if n == 1 else "s"
+            mark += ("(%d hour%s and %d minute%s of quiet pass) " % (m // 60, s(m // 60), m % 60, s(m % 60))
+                     if m >= 60 else "(%d minute%s of quiet pass) " % (m, s(m)))
+        return mark
 
     def _lg_spawn(self):
         """(Re)connect the conversation: one `run -c` client per lg session.
@@ -289,6 +310,8 @@ class Pipeline:
                 text = note + text
                 self.barged = False
                 self.barge_heard = ""
+            if text:
+                text = self.turn_clock() + text
             yield frame(b"T", text.encode("utf-8"))
             if not text:
                 return
@@ -474,6 +497,7 @@ class Pipeline:
                     if idle > (0.6 if heard else 5.0):
                         break
             self.sink = None
+            self.last_close = time.time()
             yield frame(b"E", b"")
 
 
@@ -803,6 +827,9 @@ def main():
     p.add_argument("--listener", action="store_true",
                    help="probe the model once per utterance for a [[nod]] — the face "
                    "acknowledges during the think-gap (needs a duplex-branch serve)")
+    p.add_argument("--clock", type=int, default=300,
+                   help="open every turn with the real time '[14:32] '; a quiet longer "
+                   "than N seconds also gets '(27 minutes of quiet pass)' (0 = off)")
     p.add_argument("--rate", type=int, default=22050, help="voice sample rate")
     p.add_argument("--port", type=int, default=8443)
     p.add_argument("--http", action="store_true",

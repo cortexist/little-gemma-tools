@@ -140,6 +140,8 @@ class Pipeline:
         self.sink = None                      # the active turn's frame queue
         self.last_pcm = 0.0
         self.barged = False                   # next turn opens with the barge note
+        self.barge_heard = ""                 # ...and, when the browser knows it,
+                                              # the last words that actually SOUNDED
         self._piper_spawn()
 
     def _lg_spawn(self):
@@ -195,17 +197,27 @@ class Pipeline:
                     return
                 self._emit(b"P", data)
 
-    def barge(self):
+    def barge(self, heard=""):
         """The user started talking over the reply. One bare LG_BARGE byte
         (0x02, no newline — it is a signal, not a turn) rides the client's
         stdin to the runner, which closes the turn at the next token; the
         cut-off reply stays in the session's context. Killing piper drops
         every queued clause with it — the next turn respawns the mouth.
         Between turns the byte is ignored server-side, so racing the turn's
-        own end is harmless."""
+        own end is harmless.
+
+        `heard` — the browser's estimate of the last words that actually
+        SOUNDED before the interruption (decode outruns speech ~10-50x, so
+        the context holds clauses the user never heard). It sharpens the
+        next turn's note from "(interrupting)" to "right after you said
+        «...»", so the model repairs from what was DELIVERED, not from what
+        it generated. (The elegant endpoint — rolling the context back to
+        the heard position, the probe-rollback primitive — is an engine
+        change for later; see plan.md.)"""
         if self.sink is None:
             return False
         self.barged = True
+        self.barge_heard = re.sub(r'["\n\r]', "", heard)[:80]
         try:
             self.lg.stdin.write(b"\x02")
             self.lg.stdin.flush()
@@ -270,9 +282,13 @@ class Pipeline:
         """One turn: yields framed transcript, reply clauses, and audio."""
         with self.lock:
             text = self.transcribe(blob)
-            if text and self.barged:          # voicecat's --barge-note, fixed
-                text = "(interrupting) " + text
+            if text and self.barged:          # voicecat's --barge-note, sharpened
+                note = "(interrupting) "      # by the heard-tail when known
+                if self.barge_heard:
+                    note = "(interrupting right after you said «%s») " % self.barge_heard
+                text = note + text
                 self.barged = False
+                self.barge_heard = ""
             yield frame(b"T", text.encode("utf-8"))
             if not text:
                 return
@@ -585,18 +601,31 @@ const VAD_THRESH = 0.02, HANG_MS = 700, ONSET_N = 3, PREROLL_MS = 300;
 const BARGE_THRESH = 0.04, BARGE_ONSET_N = 6;
 let rec = null, chunks = [], ctx = null, cursor = 0, rate = 22050, sched = null;
 let armed = false, talking = false, silentSince = 0, onsetRun = 0, busy = false;
-let playing = [], mouthTimers = [], deaf = false, bargeArmed = true;
+let playing = [], mouthTimers = [], deaf = false, bargeArmed = true, audioT0 = 0;
 const $ = id => document.getElementById(id);
 
 function bargeNow() {
   bargeArmed = false;
   deaf = true;                              // drop the barged turn's late frames
-  fetch('barge', { method: 'POST' });
+  // What did the user actually HEAR before interrupting? Audio is scheduled
+  // contiguously from audioT0 to cursor, so played/scheduled is exact in
+  // seconds; words are apportioned by rate over the reply text so far (an
+  // estimate — synthesis outruns playback; phoneme-timed exactness is a
+  // --phonemes follow-up). The tail rides to the server for the barge note.
+  let heard = '';
+  if (audioT0 && cursor > audioT0) {
+    const played = Math.max(0, Math.min(ctx.currentTime, cursor) - audioT0);
+    const words = $('reply').textContent.trim().split(/\s+/).filter(w => w);
+    const n = Math.round(words.length * Math.min(1, played / (cursor - audioT0)));
+    heard = words.slice(Math.max(0, n - 8), n).join(' ');
+  }
+  fetch('barge', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                   body: JSON.stringify({ heard }) });
   for (const s of playing) { try { s.stop(); } catch (e) {} }
   playing = [];
   for (const t of mouthTimers) clearTimeout(t);
   mouthTimers = [];
-  cursor = 0; sched = null;
+  cursor = 0; sched = null; audioT0 = 0;
   setMouth(REST);
 }
 
@@ -666,7 +695,7 @@ async function send(blob) {
 }
 
 async function send_(blob) {
-  deaf = false; bargeArmed = true; sched = null;
+  deaf = false; bargeArmed = true; sched = null; audioT0 = 0;
   $('you').textContent = '…'; $('reply').textContent = ''; $('ph').textContent = '';
   $('status').textContent = 'thinking';
   const res = await fetch('converse', { method: 'POST', body: blob });
@@ -715,6 +744,7 @@ function playPCM(bytes) {
   playing.push(src);                 // barge must be able to stop what's scheduled
   src.onended = () => { const i = playing.indexOf(src); if (i >= 0) playing.splice(i, 1); };
   cursor = Math.max(cursor, ctx.currentTime + 0.05);
+  if (!audioT0) audioT0 = cursor;    // the turn's speech starts sounding here
   src.start(cursor);
   if (sched) {                       // anchor this sentence's phonemes to its audio
     const t0 = cursor;
@@ -752,7 +782,8 @@ def converse():
 
 @app.route("/barge", methods=["POST"])
 def barge():
-    pipe.barge()
+    data = request.get_json(silent=True) or {}
+    pipe.barge(str(data.get("heard", ""))[:200])
     return "", 204
 
 

@@ -107,10 +107,15 @@ static double now_sec(void) {
 // slightly stale transcript — the price of slow ears, not of the probe.
 static int g_listener = 0, g_probe_ms = 1500, g_probe_gen = 6;
 #define PROBE_PAUSE_MS 440               // mid-utterance pause that invites a cue
+// The verdict grammar is the house [[tag]] form — the same inline-annotation
+// style the orchestrator will parse out of reply streams, so the listener cues
+// and the speaking-time tags become ONE grammar (one parser, one finetune
+// story). The parser below still falls back to a bare first word.
 static const char *g_probe_suffix =
-    "\n(brief listener check - I am still mid-request; reply with exactly one "
-    "lowercase word: nod if you follow me so far, mhmm to acknowledge me, "
-    "answer if my request is already complete, quiet otherwise)";
+    "\n(brief listener check - I am still mid-request, keep listening; emit "
+    "exactly one backchannel tag: [[nod]] if you follow me so far, [[mhmm]] to "
+    "acknowledge me, [[answer]] if my request is already complete, [[quiet]] "
+    "otherwise)";
 static double g_probe_t0 = 0;            // last probe's send time (rate limit + latency)
 static int    g_probe_inflight = 0;
 
@@ -276,14 +281,16 @@ static void send_probe(sock_t s) {
     }
 }
 
-// A completed probe verdict: classify its first word, act on stderr (stdout
-// belongs to the reply/TTS).
+// A completed probe verdict: take the [[tag]]'s word (or the bare first word
+// when no tag came back), classify, act on stderr (stdout belongs to the
+// reply/TTS).
 static void listener_verdict(const char *v) {
     double lat = g_probe_t0 ? now_sec() - g_probe_t0 : 0;
     g_probe_inflight = 0;
     char w[32];
     int n = 0;
-    for (const char *p = v; *p; p++) {                   // first word, lowercased
+    const char *p = strstr(v, "[[");
+    for (p = p ? p + 2 : v; *p; p++) {                   // tag / first word, lowercased
         char c = *p;
         if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
         if ((c >= 'a' && c <= 'z') || c == '-') { if (n < (int)sizeof w - 1) w[n++] = c; }

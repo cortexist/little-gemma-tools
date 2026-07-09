@@ -136,7 +136,18 @@ static const char *g_compress_ask =
     "(session maintenance) Summarize our conversation so far in under 120 "
     "words - the facts, names, preferences, any unfinished business, and a "
     "one-line description of anything you were shown or heard beyond my "
-    "words. Reply with only the summary.";
+    "words. Anchor events to their clock times where that matters. "
+    "Reply with only the summary.";
+// --memory FILE: the dated LEDGER — every compress appends one line,
+// "[Tue 2026-07-09 14:50] <digest>", and a fresh voicecat seeds its first
+// turn from the ledger's tail, so memory survives process restarts and every
+// entry is born knowing its date. This is the substrate for age-graded
+// consolidation (an idle-cycle job, not yet built): entries older than a
+// day/week/month/year merge into ever-shorter gists — a year, eventually,
+// is one sentence. The merge mechanics are more digest asks with shrinking
+// budgets; WHAT survives each merge (salience) is finetune territory —
+// measured: E4B's digest kept "pasta, Ana, vegetarian" but dropped "Friday".
+static const char *g_memory = NULL;
 
 // ---- time awareness (--clock) ---------------------------------------------------
 // GPT-Live-style temporal awareness as plain turn text — the engine never
@@ -469,6 +480,10 @@ static sock_t compress_session(sock_t s, const char *spath) {
             while (j < rn && raw[j] != '<' && raw[j] != '>' && j - i <= 24) j++;
             if (j < rn && raw[j] == '>' && j - i >= 2) { i = j + 1; continue; }
         }
+        if (raw[i] == '[' && i + 1 < rn && raw[i + 1] == '[') {   // [[tags]] drop whole
+            const char *e = strstr(raw + i + 2, "]]");
+            if (e) { i = (size_t)(e - raw) + 2; continue; }
+        }
         char c = raw[i++];
         if (c == '\n' || c == '\r' || c == '\t') c = ' ';
         if (c == ' ' && (dn == 0 || dig[dn - 1] == ' ')) continue;
@@ -489,7 +504,45 @@ static sock_t compress_session(sock_t s, const char *spath) {
     if (sl >= (int)sizeof seed) sl = (int)sizeof seed - 1;
     send_frame(ns, LG_FRAME_TEXT, seed, (uint32_t)sl);
     fprintf(stderr, "voicecat: session compressed — %d-char digest seated in a fresh context\n", (int)dn);
+    if (g_memory && dn) {               // the ledger: one dated line per compress
+        FILE *mf = fopen(g_memory, "ab");
+        if (mf) {
+            char stamp[64];
+            time_t t = time(NULL);
+            strftime(stamp, sizeof stamp, "[%a %Y-%m-%d %H:%M] ", localtime(&t));
+            fprintf(mf, "%s%s\n", stamp, dig);
+            fclose(mf);
+        } else
+            fprintf(stderr, "voicecat: cannot append to %s\n", g_memory);
+    }
     return ns;
+}
+
+// Seed a fresh voicecat from the ledger's tail: the last ~1800 chars of whole
+// dated lines ride in as the open turn's first text, so the conversation
+// resumes across process restarts already knowing when everything happened.
+static void seed_memory(sock_t s) {
+    FILE *mf = fopen(g_memory, "rb");
+    if (!mf) return;
+    char led[2048];
+    fseek(mf, 0, SEEK_END);
+    long sz = ftell(mf);
+    long off = sz > 1800 ? sz - 1800 : 0;
+    fseek(mf, off, SEEK_SET);
+    size_t n = fread(led, 1, sizeof led - 1, mf);
+    fclose(mf);
+    led[n] = 0;
+    char *p = led;
+    if (off > 0) { p = strchr(led, '\n'); p = p ? p + 1 : led; }   // whole lines only
+    for (char *q = p; *q; q++)
+        if (*q == '\n' || *q == '\r') *q = ' ';
+    while (*p == ' ') p++;
+    if (!*p) return;
+    char seed[2304];
+    int sl = snprintf(seed, sizeof seed, "(memory from our earlier conversations: %s) ", p);
+    if (sl >= (int)sizeof seed) sl = (int)sizeof seed - 1;
+    send_frame(s, LG_FRAME_TEXT, seed, (uint32_t)sl);
+    fprintf(stderr, "voicecat: %d chars of dated memory seeded from %s\n", sl, g_memory);
 }
 
 // Byte offset just past word `k` (0 = start of word 1).
@@ -536,6 +589,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--probe-suffix") && i + 1 < argc)  g_probe_suffix = argv[++i];
         else if (!strcmp(argv[i], "--idle-compress") && i + 1 < argc) g_idle_compress = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--clock") && i + 1 < argc)         g_clock = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--memory") && i + 1 < argc)        g_memory = argv[++i];
         else if (!spath)                                              spath = argv[i];
         else { fprintf(stderr, "voicecat: unknown argument %s\n", argv[i]); return 1; }
     }
@@ -556,6 +610,9 @@ int main(int argc, char **argv) {
             "  --clock N    open every turn with the real time, \"[14:32] \"; a quiet longer\n"
             "               than N seconds also gets \"(27 minutes of quiet pass)\" so the\n"
             "               model senses the gap (default 300; 0 = no time markers)\n"
+            "  --memory FILE   the dated ledger: each compress appends one \"[date] digest\"\n"
+            "               line, and a fresh voicecat seeds itself from the tail — memory\n"
+            "               that survives restarts and knows when things happened\n"
             "  no whisper model -> whole utterances as native audio spans (vision-free sessions only)\n");
         return 1;
     }
@@ -594,6 +651,7 @@ int main(int argc, char **argv) {
     if (sock_init() != 0) { fprintf(stderr, "voicecat: socket setup failed\n"); return 1; }
     sock_t s = sock_connect(spath);
     if (s == INVALID_SOCKET) { fprintf(stderr, "voicecat: connect to %s failed\n", spath); return 1; }
+    if (g_memory) seed_memory(s);
 
     int16_t frame[FR_SAMP], ring[PREROLL * FR_SAMP];
     int ring_n = 0;                                  // valid ticks in the preroll ring (rolls)

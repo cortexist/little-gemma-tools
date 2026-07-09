@@ -155,7 +155,8 @@ class Pipeline:
         return-greetings (but not both at once — hence the threshold)."""
         if self.args.clock <= 0:
             return ""
-        mark = time.strftime("[%a %H:%M] " if self.first_turn else "[%H:%M] ")
+        # the first marker carries the date, so "Friday" can be stored absolute
+        mark = time.strftime("[%a %Y-%m-%d %H:%M] " if self.first_turn else "[%H:%M] ")
         gap = time.time() - self.last_close if self.last_close else 0
         self.first_turn = False
         if gap >= self.args.clock:

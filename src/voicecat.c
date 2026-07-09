@@ -168,7 +168,9 @@ static const char *turn_clock(void) {
     static char buf[96];
     if (g_clock <= 0) return "";
     time_t t = time(NULL);
-    size_t n = strftime(buf, sizeof buf, g_first_turn ? "[%a %H:%M] " : "[%H:%M] ", localtime(&t));
+    size_t n = strftime(buf, sizeof buf,                 // the first marker carries the
+                        g_first_turn ? "[%a %Y-%m-%d %H:%M] " : "[%H:%M] ",   // date, so "Friday"
+                        localtime(&t));                  // can be stored as an absolute day
     double gap = g_last_close > 0 ? now_sec() - g_last_close : 0;
     if (!g_first_turn && gap >= (double)g_clock) {
         int mins = (int)(gap / 60.0 + 0.5);

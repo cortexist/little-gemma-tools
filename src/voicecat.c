@@ -119,6 +119,24 @@ static const char *g_probe_suffix =
 static double g_probe_t0 = 0;            // last probe's send time (rate limit + latency)
 static int    g_probe_inflight = 0;
 
+// ---- idle compression (--idle-compress) ----------------------------------------
+// A long-lived session slowly fills the runner's context. After a long QUIET
+// (no speech, no reply in flight) the session compresses itself: ask the model
+// for a digest of the conversation (consumed here — never spoken), reopen a
+// FRESH session (the runner re-seats its -sys prefix from saved rows
+// instantly), and seat the digest as the open turn's first 'T' text — the
+// engine prefills it on arrival, during the idle, so the user's next words
+// simply continue a conversation the model still remembers, at a fraction of
+// the context positions. This is the beyond-voice REHYDRATION mechanism with
+// an idle trigger; the policy (the ask, the seed wording, the timing) lives
+// HERE. What a digest cannot keep: verbatim wording, and raw media spans (a
+// camera-locked session comes back with its ears, per the A/V exclusion).
+static int g_idle_compress = 900;        // seconds of quiet that trigger it (0 = off)
+static const char *g_compress_ask =
+    "(session maintenance) Summarize our conversation so far in under 120 "
+    "words - the facts, names, preferences, and any unfinished business. "
+    "Reply with only the summary.";
+
 // ---- the wire (mmcat's idioms; the socket here is NON-BLOCKING) --------------
 static int send_all(sock_t s, const void *buf, size_t n) {
     const char *p = buf;
@@ -358,6 +376,82 @@ static void deliver(const char *in, int k, int *pending, int *tstate) {
     fflush(stdout);
 }
 
+static sock_t sock_connect(const char *spath) {
+    struct sockaddr_un sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sun_family = AF_UNIX;
+    if (strlen(spath) >= sizeof sa.sun_path) return INVALID_SOCKET;
+    strcpy(sa.sun_path, spath);
+    sock_t s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) return s;
+    if (connect(s, (struct sockaddr *)&sa, sizeof sa) != 0) { sock_close(s); return INVALID_SOCKET; }
+#ifdef _WIN32
+    u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
+#else
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+#endif
+    return s;
+}
+
+// The idle-compression cycle (see the flag comment above). Blocks the mic loop
+// for one digest generation — the user has been quiet for many minutes, and a
+// live mic's queued ticks catch up afterwards exactly like a whisper pass.
+// On any trouble the old session stays; on success returns the fresh socket.
+static sock_t compress_session(sock_t s, const char *spath) {
+    fprintf(stderr, "voicecat: idle — compressing the session\n");
+    char ask[512];
+    int an = snprintf(ask, sizeof ask, "%s\n", g_compress_ask);
+    if (an >= (int)sizeof ask || send_all(s, ask, (size_t)an) != 0) return s;
+    char raw[8192];                     // the digest reply: consumed, never spoken
+    size_t rn = 0;
+    int st = 0, done = 0;
+    double t0 = now_sec();
+    while (!done && now_sec() - t0 < 120.0) {
+        char buf[1024];
+        int k = (int)recv(s, buf, sizeof buf, 0);
+        if (k <= 0) {
+            if (k < 0 && wouldblock()) { msleep(20); continue; }
+            break;
+        }
+        done = turn_ends(buf, k, &st) > 0;
+        for (int i = 0; i < k && rn < sizeof raw - 1; i++) raw[rn++] = buf[i];
+    }
+    raw[rn] = 0;
+    if (!done) {
+        fprintf(stderr, "voicecat: digest never finished — keeping the session as it is\n");
+        return s;
+    }
+    char dig[4096];                     // thought spans and <tokens> stripped
+    size_t dn = 0;
+    for (size_t i = 0; i < rn && dn < sizeof dig - 1; ) {
+        if (!strncmp(raw + i, "<|channel>", 10)) {
+            const char *e = strstr(raw + i + 10, "<channel|>");
+            i = e ? (size_t)(e - raw) + 10 : rn;
+            continue;
+        }
+        if (raw[i] == '<') {
+            size_t j = i + 1;
+            while (j < rn && raw[j] != '<' && raw[j] != '>' && j - i <= 24) j++;
+            if (j < rn && raw[j] == '>' && j - i >= 2) { i = j + 1; continue; }
+        }
+        char c = raw[i++];
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        if (c == ' ' && (dn == 0 || dig[dn - 1] == ' ')) continue;
+        dig[dn++] = c;
+    }
+    while (dn && dig[dn - 1] == ' ') dn--;
+    dig[dn] = 0;
+    sock_close(s);
+    sock_t ns = sock_connect(spath);
+    if (ns == INVALID_SOCKET) { fprintf(stderr, "voicecat: reconnect failed after compress\n"); exit(1); }
+    char seed[4608];
+    int sl = snprintf(seed, sizeof seed, "(memory of our conversation before this pause: %s) ", dig);
+    if (sl >= (int)sizeof seed) sl = (int)sizeof seed - 1;
+    send_frame(ns, LG_FRAME_TEXT, seed, (uint32_t)sl);
+    fprintf(stderr, "voicecat: session compressed — %d-char digest seated in a fresh context\n", (int)dn);
+    return ns;
+}
+
 // Byte offset just past word `k` (0 = start of word 1).
 static size_t after_word(const char *s, int k) {
     const char *p = s;
@@ -400,6 +494,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--probe-ms") && i + 1 < argc)      g_probe_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--probe-gen") && i + 1 < argc)     g_probe_gen = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--probe-suffix") && i + 1 < argc)  g_probe_suffix = argv[++i];
+        else if (!strcmp(argv[i], "--idle-compress") && i + 1 < argc) g_idle_compress = atoi(argv[++i]);
         else if (!spath)                                              spath = argv[i];
         else { fprintf(stderr, "voicecat: unknown argument %s\n", argv[i]); return 1; }
     }
@@ -415,6 +510,8 @@ int main(int argc, char **argv) {
             "               (replay recordings realistically; a real mic paces itself)\n"
             "  --listener   probe the model while the user speaks (after commits and on\n"
             "               pauses): nod/backchannel/end-point actions on stderr; needs whisper\n"
+            "  --idle-compress N   after N seconds of quiet, digest the conversation into a\n"
+            "               fresh session (default 900; 0 = off) — long sessions stay young\n"
             "  no whisper model -> whole utterances as native audio spans (vision-free sessions only)\n");
         return 1;
     }
@@ -450,18 +547,9 @@ int main(int argc, char **argv) {
     }
 
     // the session socket, non-blocking so reply bytes drain between mic ticks
-    struct sockaddr_un sa; memset(&sa, 0, sizeof sa); sa.sun_family = AF_UNIX;
-    if (sock_init() != 0 || strlen(spath) >= sizeof sa.sun_path) { fprintf(stderr, "voicecat: socket setup failed\n"); return 1; }
-    strcpy(sa.sun_path, spath);
-    sock_t s = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (s == INVALID_SOCKET || connect(s, (struct sockaddr *)&sa, sizeof sa) != 0) {
-        fprintf(stderr, "voicecat: connect to %s failed\n", spath); return 1;
-    }
-#ifdef _WIN32
-    u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
-#else
-    fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
-#endif
+    if (sock_init() != 0) { fprintf(stderr, "voicecat: socket setup failed\n"); return 1; }
+    sock_t s = sock_connect(spath);
+    if (s == INVALID_SOCKET) { fprintf(stderr, "voicecat: connect to %s failed\n", spath); return 1; }
 
     int16_t frame[FR_SAMP], ring[PREROLL * FR_SAMP];
     int ring_n = 0;                                  // valid ticks in the preroll ring (rolls)
@@ -477,6 +565,8 @@ int main(int argc, char **argv) {
     int pending = 0, barge_armed = 1, tstate = 0;    // replies awaited; one barge per utterance
     char rbuf[4096];
     double rt0 = 0; long rtn = 0;                    // --realtime deadline pacing
+    double last_activity = now_sec();                // the idle clock (--idle-compress)
+    int dirty = 0;                                   // turns exchanged since the last compress
 
     fprintf(stderr, "voicecat: %s, listening\n", whisper ? "streaming transcripts" : "native audio spans");
     for (;;) {
@@ -498,6 +588,16 @@ int main(int argc, char **argv) {
             int k = (int)recv(s, rbuf, sizeof rbuf, 0);
             if (k <= 0) break;
             deliver(rbuf, k, &pending, &tstate);
+        }
+
+        // the idle clock: any speech or reply in flight resets it; a long
+        // enough quiet (and something worth remembering) compresses the session
+        if (in_utt || pending > 0) last_activity = now_sec();
+        else if (g_idle_compress > 0 && dirty && !g_probe_inflight &&
+                 now_sec() - last_activity > (double)g_idle_compress) {
+            s = compress_session(s, spath);
+            dirty = 0;
+            last_activity = now_sec();
         }
 
         if (!eof) {
@@ -622,7 +722,7 @@ int main(int argc, char **argv) {
                     if (L > sizeof line - 2) L = sizeof line - 2;
                     line[L] = '\n'; line[L + 1] = 0;
                     send_all(s, line, L + 1);
-                    pending++; barge_armed = 1; barged = 0;
+                    pending++; barge_armed = 1; barged = 0; dirty = 1;
                     fprintf(stderr, "voicecat: turn closed (%d+ words)\n", committed);
                 }
             } else if (ub_n >= LG_RATE / 2) {            // native span; drop sub-0.5s blips
@@ -632,7 +732,7 @@ int main(int argc, char **argv) {
                 if (barged) { send_frame(s, LG_FRAME_TEXT, g_barge_note, (uint32_t)strlen(g_barge_note)); barged = 0; }
                 send_frame(s, LG_FRAME_AUDIO, ub, (uint32_t)((ub_n + pad) * 2));
                 send_all(s, "\n", 1);
-                pending++; barge_armed = 1;
+                pending++; barge_armed = 1; dirty = 1;
                 fprintf(stderr, "voicecat: turn closed (%.1fs audio)\n", (double)ub_n / LG_RATE);
             }
         }

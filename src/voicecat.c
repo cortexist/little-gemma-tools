@@ -136,18 +136,41 @@ static const char *g_compress_ask =
     "(session maintenance) Summarize our conversation so far in under 120 "
     "words - the facts, names, preferences, any unfinished business, and a "
     "one-line description of anything you were shown or heard beyond my "
-    "words. Anchor events to their clock times where that matters. "
-    "Reply with only the summary.";
+    "words. Anchor events to their clock times where that matters. When a "
+    "fact changed during our talk, state it as a dated transition - old to "
+    "new, never only the old state. Reply with only the summary.";
 // --memory FILE: the dated LEDGER — every compress appends one line,
 // "[Tue 2026-07-09 14:50] <digest>", and a fresh voicecat seeds its first
 // turn from the ledger's tail, so memory survives process restarts and every
-// entry is born knowing its date. This is the substrate for age-graded
-// consolidation (an idle-cycle job, not yet built): entries older than a
-// day/week/month/year merge into ever-shorter gists — a year, eventually,
-// is one sentence. The merge mechanics are more digest asks with shrinking
-// budgets; WHAT survives each merge (salience) is finetune territory —
-// measured: E4B's digest kept "pasta, Ana, vegetarian" but dropped "Friday".
+// entry is born knowing its date.
+//
+// CONSOLIDATION (runs at startup and after each compress, over throwaway
+// serve sessions): the ledger ages the way human memory does — raw dated
+// digests older than a week fold into "[week of YYYY-MM-DD]" lines, week
+// lines older than a month into "[YYYY-MM]", months older than a year into
+// "[YYYY]" one-liners under the flashbulb ask (most words on the defining
+// event, its small details kept verbatim). Graphiti's bi-temporal model,
+// translated to plain text: validity lives in the WORDING (changes are
+// dated transitions, old to new — never only the old state), contradiction
+// resolves by the seed's newest-wins rule instead of edge invalidation, and
+// nothing is ever lost except through a successful, budgeted merge (a
+// failed ask copies the originals through untouched).
 static const char *g_memory = NULL;
+static const char *g_merge_week =
+    "(memory maintenance) Merge these notes from one week into a single line "
+    "of at most 18 words. Keep names, dates, unfinished business, and any "
+    "change as a dated transition - old to new, never only the old state. "
+    "Drop the routine. Reply with only the line.";
+static const char *g_merge_month =
+    "(memory maintenance) Merge these notes from one month into a single "
+    "line of at most 14 words. Keep only what will still matter in a year; "
+    "keep changes as dated transitions. Reply with only the line.";
+static const char *g_merge_year =
+    "(memory maintenance) Merge these notes from one year into one short "
+    "passage of at most 35 words. Spend nearly all of it on the single most "
+    "defining event, keeping its small details - the little things. "
+    "Everything else gets a few words at most, or nothing at all. "
+    "Reply with only the passage.";
 
 // ---- time awareness (--clock) ---------------------------------------------------
 // GPT-Live-style temporal awareness as plain turn text — the engine never
@@ -441,16 +464,9 @@ static sock_t sock_connect(const char *spath) {
     return s;
 }
 
-// The idle-compression cycle (see the flag comment above). Blocks the mic loop
-// for one digest generation — the user has been quiet for many minutes, and a
-// live mic's queued ticks catch up afterwards exactly like a whisper pass.
-// On any trouble the old session stays; on success returns the fresh socket.
-static sock_t compress_session(sock_t s, const char *spath) {
-    fprintf(stderr, "voicecat: idle — compressing the session\n");
-    char ask[512];
-    int an = snprintf(ask, sizeof ask, "%s\n", g_compress_ask);
-    if (an >= (int)sizeof ask || send_all(s, ask, (size_t)an) != 0) return s;
-    char raw[8192];                     // the digest reply: consumed, never spoken
+// Collect one full reply from the socket (until "<turn|>", 120 s cap).
+// Returns the byte count, or -1 when the turn never finished.
+static int read_turn(sock_t s, char *raw, size_t cap) {
     size_t rn = 0;
     int st = 0, done = 0;
     double t0 = now_sec();
@@ -462,16 +478,17 @@ static sock_t compress_session(sock_t s, const char *spath) {
             break;
         }
         done = turn_ends(buf, k, &st) > 0;
-        for (int i = 0; i < k && rn < sizeof raw - 1; i++) raw[rn++] = buf[i];
+        for (int i = 0; i < k && rn < cap - 1; i++) raw[rn++] = buf[i];
     }
     raw[rn] = 0;
-    if (!done) {
-        fprintf(stderr, "voicecat: digest never finished — keeping the session as it is\n");
-        return s;
-    }
-    char dig[4096];                     // thought spans and <tokens> stripped
+    return done ? (int)rn : -1;
+}
+
+// A model reply -> one plain line: thought spans, <tokens> and [[tags]]
+// dropped whole, whitespace folded. Returns the length.
+static size_t strip_reply(const char *raw, size_t rn, char *dig, size_t cap) {
     size_t dn = 0;
-    for (size_t i = 0; i < rn && dn < sizeof dig - 1; ) {
+    for (size_t i = 0; i < rn && dn < cap - 1; ) {
         if (!strncmp(raw + i, "<|channel>", 10)) {
             const char *e = strstr(raw + i + 10, "<channel|>");
             i = e ? (size_t)(e - raw) + 10 : rn;
@@ -493,7 +510,188 @@ static sock_t compress_session(sock_t s, const char *spath) {
     }
     while (dn && dig[dn - 1] == ' ') dn--;
     dig[dn] = 0;
+    return dn;
+}
+
+// One question, one throwaway session: ask + material as a single turn,
+// stripped reply into `out`. -1 on any trouble (caller keeps its originals).
+static int ask_once(const char *spath, const char *ask, const char *material, char *out, size_t cap) {
+    sock_t s = sock_connect(spath);
+    if (s == INVALID_SOCKET) return -1;
+    int bad = send_all(s, ask, strlen(ask)) != 0 ||
+              (material && (send_all(s, " ", 1) != 0 || send_all(s, material, strlen(material)) != 0)) ||
+              send_all(s, "\n", 1) != 0;
+    char raw[16384];
+    int rn = bad ? -1 : read_turn(s, raw, sizeof raw);
     sock_close(s);
+    if (rn < 0) return -1;
+    return strip_reply(raw, (size_t)rn, out, cap) > 0 ? 0 : -1;
+}
+
+// Parse a ledger line's period: 0 = raw "[Thu 2026-07-09 14:31]", 1 = week
+// "[week of 2026-06-29]", 2 = month "[2026-06]", 3 = year "[2026]"; -1 = no
+// date. Fills `start` with the period's first day (noon, DST-safe).
+static int ledger_period(const char *line, struct tm *start) {
+    int y = 0, m = 0, d = 0, hh, mm;
+    memset(start, 0, sizeof *start);
+    start->tm_mday = 1; start->tm_hour = 12; start->tm_isdst = -1;
+    if (sscanf(line, "[%*3s %d-%d-%d %d:%d]", &y, &m, &d, &hh, &mm) == 5 && m >= 1 && m <= 12) {
+        start->tm_year = y - 1900; start->tm_mon = m - 1; start->tm_mday = d;
+        return 0;
+    }
+    if (sscanf(line, "[week of %d-%d-%d]", &y, &m, &d) == 3 && m >= 1 && m <= 12) {
+        start->tm_year = y - 1900; start->tm_mon = m - 1; start->tm_mday = d;
+        return 1;
+    }
+    if (sscanf(line, "[%d-%d]", &y, &m) == 2 && y >= 1970 && m >= 1 && m <= 12) {
+        start->tm_year = y - 1900; start->tm_mon = m - 1;
+        return 2;
+    }
+    if (sscanf(line, "[%d]", &y) == 1 && y >= 1970) {
+        start->tm_year = y - 1900;
+        return 3;
+    }
+    return -1;
+}
+
+// Is this line old enough to fold into the next level? Raw lines age out
+// after a week, week lines after ~a month, month lines after ~a year.
+static int ledger_due(const char *line, time_t now, int *kind, time_t *t0) {
+    struct tm st;
+    *kind = ledger_period(line, &st);
+    if (*kind < 0 || *kind > 2) return 0;
+    *t0 = mktime(&st);
+    if (*t0 <= 0) return 0;
+    double age = difftime(now, *t0);
+    return (*kind == 0 && age > 7 * 86400.0) ||
+           (*kind == 1 && age > 35 * 86400.0) ||
+           (*kind == 2 && age > 400 * 86400.0);
+}
+
+// The merged line's prefix: a raw line folds to its week's Monday, a week
+// line to its month, a month line to its year.
+static void ledger_prefix(int kind, time_t t0, char *prefix, size_t cap) {
+    struct tm lt = *localtime(&t0);
+    if (kind == 0) {
+        time_t w = t0 - (time_t)((lt.tm_wday + 6) % 7) * 86400;
+        lt = *localtime(&w);
+        strftime(prefix, cap, "[week of %Y-%m-%d]", &lt);
+    } else if (kind == 1)
+        strftime(prefix, cap, "[%Y-%m]", &lt);
+    else
+        strftime(prefix, cap, "[%Y]", &lt);
+}
+
+// Age the ledger (see the --memory comment): fold every due group through
+// its merge ask over a THROWAWAY session — call only while no main session
+// occupies the server. A failed ask copies its lines through untouched;
+// oversized groups merge in batches whose partial gists share a prefix and
+// unify at the next level up.
+static void consolidate_ledger(const char *spath) {
+    FILE *f = fopen(g_memory, "rb");
+    if (!f) return;
+    static char buf[1 << 20];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    if (!n) return;
+    static char *lines[8192];
+    int nlines = 0;
+    for (char *q = buf; *q && nlines < 8192; ) {
+        lines[nlines++] = q;
+        char *e = strchr(q, '\n');
+        if (!e) break;
+        *e = 0;
+        q = e + 1;
+    }
+    char tmp[1024];
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", g_memory) >= (int)sizeof tmp) return;
+    FILE *out = fopen(tmp, "wb");
+    if (!out) return;
+    time_t now = time(NULL);
+    int merges = 0, fails = 0;
+    for (int i = 0; i < nlines; ) {
+        int kind;
+        time_t t0;
+        if (!*lines[i]) { i++; continue; }
+        if (!ledger_due(lines[i], now, &kind, &t0)) {
+            fprintf(out, "%s\n", lines[i++]);
+            continue;
+        }
+        char prefix[32], pf2[32];
+        ledger_prefix(kind, t0, prefix, sizeof prefix);
+        char material[6144];
+        size_t mlen = 0;
+        int j = i;
+        while (j < nlines) {                             // same kind, same target, still due
+            size_t L = strlen(lines[j]);
+            if (j > i) {
+                int k2; time_t t2;
+                if (!ledger_due(lines[j], now, &k2, &t2) || k2 != kind) break;
+                ledger_prefix(kind, t2, pf2, sizeof pf2);
+                if (strcmp(pf2, prefix)) break;
+                if (mlen + L + 2 > sizeof material) break;
+            }
+            memcpy(material + mlen, lines[j], L);
+            mlen += L;
+            material[mlen++] = ' ';
+            j++;
+        }
+        material[mlen] = 0;
+        const char *ask = kind == 0 ? g_merge_week : kind == 1 ? g_merge_month : g_merge_year;
+        char merged[2048];
+        if (ask_once(spath, ask, material, merged, sizeof merged) == 0) {
+            fprintf(out, "%s %s\n", prefix, merged);
+            merges++;
+        } else {
+            for (int k = i; k < j; k++) fprintf(out, "%s\n", lines[k]);
+            fails++;
+        }
+        i = j;
+    }
+    fclose(out);
+    if (merges > 0) {
+        remove(g_memory);
+        if (rename(tmp, g_memory) != 0)
+            fprintf(stderr, "voicecat: ledger rewrite failed — %s.tmp holds the update\n", g_memory);
+        else
+            fprintf(stderr, "voicecat: ledger consolidated — %d merge(s)%s\n",
+                    merges, fails ? " (some kept raw after a failed ask)" : "");
+    } else
+        remove(tmp);
+}
+
+// The idle-compression cycle (see the flag comment above). Blocks the mic loop
+// for one digest generation — the user has been quiet for many minutes, and a
+// live mic's queued ticks catch up afterwards exactly like a whisper pass.
+// On any trouble the old session stays; on success returns the fresh socket.
+static sock_t compress_session(sock_t s, const char *spath) {
+    fprintf(stderr, "voicecat: idle — compressing the session\n");
+    char ask[640];
+    int an = snprintf(ask, sizeof ask, "%s\n", g_compress_ask);
+    if (an >= (int)sizeof ask || send_all(s, ask, (size_t)an) != 0) return s;
+    char raw[8192];                     // the digest reply: consumed, never spoken
+    int rn = read_turn(s, raw, sizeof raw);
+    if (rn < 0) {
+        fprintf(stderr, "voicecat: digest never finished — keeping the session as it is\n");
+        return s;
+    }
+    char dig[4096];
+    size_t dn = strip_reply(raw, (size_t)rn, dig, sizeof dig);
+    sock_close(s);
+    if (g_memory && dn) {               // the ledger: one dated line per compress
+        FILE *mf = fopen(g_memory, "ab");
+        if (mf) {
+            char stamp[64];
+            time_t t = time(NULL);
+            strftime(stamp, sizeof stamp, "[%a %Y-%m-%d %H:%M] ", localtime(&t));
+            fprintf(mf, "%s%s\n", stamp, dig);
+            fclose(mf);
+        } else
+            fprintf(stderr, "voicecat: cannot append to %s\n", g_memory);
+    }
+    if (g_memory)                       // age the ledger while no session is open
+        consolidate_ledger(spath);
     sock_t ns = sock_connect(spath);
     if (ns == INVALID_SOCKET) { fprintf(stderr, "voicecat: reconnect failed after compress\n"); exit(1); }
     char seed[4608];
@@ -506,17 +704,6 @@ static sock_t compress_session(sock_t s, const char *spath) {
     if (sl >= (int)sizeof seed) sl = (int)sizeof seed - 1;
     send_frame(ns, LG_FRAME_TEXT, seed, (uint32_t)sl);
     fprintf(stderr, "voicecat: session compressed — %d-char digest seated in a fresh context\n", (int)dn);
-    if (g_memory && dn) {               // the ledger: one dated line per compress
-        FILE *mf = fopen(g_memory, "ab");
-        if (mf) {
-            char stamp[64];
-            time_t t = time(NULL);
-            strftime(stamp, sizeof stamp, "[%a %Y-%m-%d %H:%M] ", localtime(&t));
-            fprintf(mf, "%s%s\n", stamp, dig);
-            fclose(mf);
-        } else
-            fprintf(stderr, "voicecat: cannot append to %s\n", g_memory);
-    }
     return ns;
 }
 
@@ -541,7 +728,11 @@ static void seed_memory(sock_t s) {
     while (*p == ' ') p++;
     if (!*p) return;
     char seed[2304];
-    int sl = snprintf(seed, sizeof seed, "(memory from our earlier conversations: %s) ", p);
+    // newest-wins is the read-side of Graphiti's invalidation: entries are
+    // chronological and never rewritten, so contradictions resolve at recall
+    int sl = snprintf(seed, sizeof seed,
+                      "(memory from our earlier conversations, oldest first - "
+                      "where entries disagree, the newest is current: %s) ", p);
     if (sl >= (int)sizeof seed) sl = (int)sizeof seed - 1;
     send_frame(s, LG_FRAME_TEXT, seed, (uint32_t)sl);
     fprintf(stderr, "voicecat: %d chars of dated memory seeded from %s\n", sl, g_memory);
@@ -651,7 +842,8 @@ int main(int argc, char **argv) {
 
     // the session socket, non-blocking so reply bytes drain between mic ticks
     if (sock_init() != 0) { fprintf(stderr, "voicecat: socket setup failed\n"); return 1; }
-    sock_t s = sock_connect(spath);
+    if (g_memory) consolidate_ledger(spath);   // throwaway sessions — must run
+    sock_t s = sock_connect(spath);            // before the main session occupies
     if (s == INVALID_SOCKET) { fprintf(stderr, "voicecat: connect to %s failed\n", spath); return 1; }
     if (g_memory) seed_memory(s);
 

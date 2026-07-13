@@ -53,6 +53,7 @@ static int  wouldblock(void) { return WSAGetLastError() == WSAEWOULDBLOCK; }
 #else
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
@@ -73,11 +74,16 @@ static int  wouldblock(void) { return errno == EAGAIN || errno == EWOULDBLOCK; }
 #define ONSET   3                        // consecutive voiced ticks that open an utterance (60 ms)
 
 static const char *g_whisper_bin = NULL, *g_whisper_model = NULL;
+static const char *g_whisper_url = NULL;   // resident whisper-server: no model load per pass
 static const char *g_barge_note = "(interrupting) ";
 // Commit cadence must comfortably exceed one ASR invocation (~0.6s for CUDA
 // base.en via whisper-cli, process+model load included) or passes stack up
 // and the loop falls behind real time: keep commit_ms >= 3x the pass cost.
 static int g_commit_ms = 2500, g_hang_ms = 700, g_vad = 400, g_realtime = 0;
+// While a reply is live (pending, or the mouth still sounding) the bar to
+// open an utterance is HIGHER and LONGER — the browser demo's BARGE_THRESH
+// rule: echo residuals and AEC startup transients must not cut the mouth.
+static int g_barge_mult = 2, g_barge_onset = 6;
 
 static double now_sec(void) {
     struct timespec ts;
@@ -278,6 +284,48 @@ static size_t parse_ts(const char *p) {                  // "hh:mm:ss.mmm" -> sa
     if (sscanf(p, "%d:%d:%lf", &h, &m, &sec) != 3) return 0;
     return (size_t)(((h * 60 + m) * 60 + sec) * LG_RATE);
 }
+
+// Append one transcript line/segment to `out`: [..] (..) tags stripped whole,
+// whitespace folded, a trailing space closes the last word. `w` = bytes in
+// out, `words` = completed words — both run cumulatively across calls.
+static void words_add(const char *text, char *out, size_t *w, size_t cap, int *words) {
+    for (size_t i = 0; text[i]; ) {
+        char c = text[i];
+        if (c == '[' || c == '(') {
+            char close = c == '[' ? ']' : ')';
+            while (text[i] && text[i] != close) i++;
+            if (text[i]) i++;
+            continue;
+        }
+        char cc = (c == '\r' || c == '\t' || c == '\n') ? ' ' : c;
+        if (cc == ' ' && (*w == 0 || out[*w - 1] == ' ')) { i++; continue; }
+        if (*w + 1 < cap) { out[(*w)++] = cc; out[*w] = 0; }
+        if (cc == ' ') (*words)++;
+        i++;
+    }
+    if (*w && out[*w - 1] != ' ' && *w + 1 < cap) { out[(*w)++] = ' '; out[*w] = 0; (*words)++; }
+}
+
+// whisper-server's vtt: "WEBVTT", then cues of "t0 --> t1" on one line and
+// the text on the following line(s) — the cue's end closes the segment when
+// the NEXT cue begins (or the input ends). Fills out/segs like the cli parse.
+static void whisper_vtt(char *raw, char *out, size_t cap, struct wseg *segs, int *nseg) {
+    size_t w = 0, pend = 0;
+    int words = 0, seg_open = 0;
+    for (char *line = raw; line && *line; ) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        char *arrow = strstr(line, "-->");
+        if (arrow) {
+            if (seg_open && *nseg < WSEG_MAX) { segs[*nseg].end_samp = pend; segs[*nseg].words = words; (*nseg)++; }
+            pend = parse_ts(arrow + 3 + strspn(arrow + 3, " "));
+            seg_open = 1;
+        } else if (seg_open && *line)
+            words_add(line, out, &w, cap, &words);
+        line = nl ? nl + 1 : NULL;
+    }
+    if (seg_open && *nseg < WSEG_MAX) { segs[*nseg].end_samp = pend; segs[*nseg].words = words; (*nseg)++; }
+}
 static int whisper_pass(const int16_t *pcm, size_t nsamp, const char *prompt,
                         char *out, size_t cap, struct wseg *segs, int *nseg) {
     if (cap) out[0] = 0;
@@ -295,13 +343,24 @@ static int whisper_pass(const int16_t *pcm, size_t nsamp, const char *prompt,
     char cmd[4096];
     // the extra outer quotes are for cmd.exe: a /c string that STARTS with a
     // quote gets its first and last quote stripped, mangling every path inside
-    snprintf(cmd, sizeof cmd,
+    if (g_whisper_url)
+        // resident server: the pass pays inference only, no model load —
+        // vtt keeps the reply small and carries the segment timestamps
+        snprintf(cmd, sizeof cmd,
 #ifdef _WIN32
-             "\"\"%s\" -m \"%s\" -f \"%s\" -np --prompt \"%s\" 2>NUL\"",
+                 "\"curl -s --max-time 30 -F file=@\"%s\" -F response_format=vtt -F prompt=\"%s\" \"%s\" 2>NUL\"",
 #else
-             "\"%s\" -m \"%s\" -f \"%s\" -np --prompt \"%s\" 2>/dev/null",
+                 "curl -s --max-time 30 -F file=@\"%s\" -F response_format=vtt -F prompt=\"%s\" \"%s\" 2>/dev/null",
 #endif
-             bin, g_whisper_model, wav, parg);
+                 wav, parg, g_whisper_url);
+    else
+        snprintf(cmd, sizeof cmd,
+#ifdef _WIN32
+                 "\"\"%s\" -m \"%s\" -f \"%s\" -np --prompt \"%s\" 2>NUL\"",
+#else
+                 "\"%s\" -m \"%s\" -f \"%s\" -np --prompt \"%s\" 2>/dev/null",
+#endif
+                 bin, g_whisper_model, wav, parg);
     FILE *f = run_pipe(cmd);
     if (!f) { remove(wav); fprintf(stderr, "voicecat: whisper spawn failed\n"); return -1; }
     char raw[16384]; size_t n = fread(raw, 1, sizeof raw - 1, f); raw[n] = 0;
@@ -309,39 +368,34 @@ static int whisper_pass(const int16_t *pcm, size_t nsamp, const char *prompt,
     remove(wav);
     if (n == 0 && rc != 0) { fprintf(stderr, "voicecat: whisper failed (rc %d) — is it on PATH?\n", rc); return -1; }
 
-    size_t w = 0; int words = 0;
-    char *line = raw;
-    while (line && *line) {
-        char *nl = strchr(line, '\n');
-        if (nl) *nl = 0;
-        char *text = line;
-        size_t seg_end = 0;
-        char *arrow = strstr(line, "-->");
-        if (line[0] == '[' && arrow) {                   // "[t0 --> t1]  text"
-            seg_end = parse_ts(arrow + 3 + strspn(arrow + 3, " "));
-            char *close = strchr(arrow, ']');
-            text = close ? close + 1 : arrow + 3;
-        }
-        for (size_t i = 0; text[i]; ) {                  // strip [..] (..) tags, keep words
-            char c = text[i];
-            if (c == '[' || c == '(') {
-                char close = c == '[' ? ']' : ')';
-                while (text[i] && text[i] != close) i++;
-                if (text[i]) i++;
-                continue;
+    if (g_whisper_url)
+        whisper_vtt(raw, out, cap, segs, nseg);
+    else {
+        size_t w = 0; int words = 0;
+        char *line = raw;
+        while (line && *line) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = 0;
+            char *text = line;
+            size_t seg_end = 0;
+            char *arrow = strstr(line, "-->");
+            if (line[0] == '[' && arrow) {               // "[t0 --> t1]  text"
+                seg_end = parse_ts(arrow + 3 + strspn(arrow + 3, " "));
+                char *close = strchr(arrow, ']');
+                text = close ? close + 1 : arrow + 3;
             }
-            char cc = (c == '\r' || c == '\t') ? ' ' : c;
-            if (cc == ' ' && (w == 0 || out[w - 1] == ' ')) { i++; continue; }
-            if (w + 1 < cap) { out[w++] = cc; out[w] = 0; }
-            if (cc == ' ') words++;                      // completed a word
-            i++;
+            words_add(text, out, &w, cap, &words);
+            if (seg_end && *nseg < WSEG_MAX) { segs[*nseg].end_samp = seg_end; segs[*nseg].words = words; (*nseg)++; }
+            line = nl ? nl + 1 : NULL;
         }
-        if (w && out[w - 1] != ' ' && w + 1 < cap) { out[w++] = ' '; out[w] = 0; words++; }
-        if (seg_end && *nseg < WSEG_MAX) { segs[*nseg].end_samp = seg_end; segs[*nseg].words = words; (*nseg)++; }
-        line = nl ? nl + 1 : NULL;
     }
+    size_t w = strlen(out);
     while (w && out[w - 1] == ' ') out[--w] = 0;
-    if (*nseg == 0 && w) { segs[0].end_samp = nsamp; segs[0].words = words; *nseg = 1; }
+    if (*nseg == 0 && w) {                               // no cues: one whole-window segment
+        int words = 1;
+        for (size_t i = 0; out[i]; i++) words += out[i] == ' ';
+        segs[0].end_samp = nsamp; segs[0].words = words; *nseg = 1;
+    }
     return 0;
 }
 
@@ -435,6 +489,296 @@ static int pf_feed(const char *in, int n, char *out) {
     return on;
 }
 
+// ---- the mouth (--mouth-synth / --mouth-play) ----------------------------------
+// voicecat OWNS the TTS when these are set: reply text runs through clausecat's
+// split policy IN-PROCESS (the long-planned absorb — its trigger was exactly
+// this: a shell pipeline's buffered clauses keep playing after a barge), clause
+// lines feed a synth spawned ONCE (piper's cold start is ~4s on the Orin — it
+// must stay warm) speaking piper's mux framing, and live PCM is pumped through
+// a ring into a small, cheaply-respawned player. A barge then kills ONLY the
+// player (sound stops within its latency buffer) and marks every clause sent
+// so far stale — their frames drain unheard, counted exactly, no timing
+// heuristics. POSIX only; the flags refuse politely on Windows.
+static const char *g_mouth_synth = NULL, *g_mouth_play = NULL;
+static int g_hush_tail = 0;                  // --hush-tail: cut on speech over the reply's tail
+#ifndef _WIN32
+static long  m_synth_pid = 0, m_play_pid = 0;
+static int   m_synth_in = -1, m_synth_out = -1, m_play_in = -1;
+static char *m_ring = NULL;                  // PCM waiting for the player
+static size_t m_rn = 0, m_rcap = 0;
+static double m_last_pcm = 0;                // last byte from the synth (drain/escape clock)
+// The speaking-state is an AUDIBLE-HORIZON clock: bytes handed to the player
+// divided by the stream rate say exactly when the sound RUNS OUT — pipe
+// activity says nothing (the synth outruns real time ~8x, so the pump goes
+// idle seconds into a long reply while half a minute still plays downstream;
+// measured: barge never fired and every reply queued behind the backlog).
+static double m_audible_until = 0;
+static int    m_rate = 22050;                // from the synth's mux 'C' frame
+// The synth speaks piper's mux framing ([kind][u32 len][payload]), which
+// makes the barge discard EXACT: a cut drops a set_voice control line with
+// an unresolvable sentinel value down the synth's stdin — piper consumes it
+// in order, echoes it back as an 'M' frame (the audio never switches), and
+// every 'P' frame BEFORE that echo is stale by construction. No timing
+// heuristics: a synth mid-cold-start can't leak stale audio past a gap
+// timer that isn't there. ('A' schedule frames exist only on alignment-
+// enabled voices — never counted on.)
+#define M_MARK "vc-cut"
+static long m_marks_sent = 0, m_marks_seen = 0;
+static int  m_mute_turn = 0;                 // post-barge: eat the dying reply's tail clauses
+static struct { uint8_t head[5]; uint32_t hn, len, got; uint8_t kind; char meta[64]; uint32_t mn; } m_fr;
+
+// clausecat's machine, verbatim policy (no --allow-control-token, no
+// --route-emotion here yet): thought spans and <tokens> dropped, [[tags]]
+// dropped whole, a clause line flushes at punctuation + space.
+static struct {
+    char line[8192]; size_t ln;
+    char tag[27];    size_t tn;
+    int thought;     size_t cn;
+    int tcall;       size_t tcn;
+    char tsp[64];    size_t bn;
+    int brk, pb;
+} m_cl;
+
+static int spawn_cmd(const char *cmd, int *in_fd, int *out_fd) {
+    int pi[2] = { -1, -1 }, po[2] = { -1, -1 };
+    if ((in_fd && pipe(pi) != 0) || (out_fd && pipe(po) != 0)) return -1;
+    long pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        setpgid(0, 0);                       // own group: a kill(-pid) gets the whole sh -c tree
+        if (in_fd) { dup2(pi[0], 0); close(pi[0]); close(pi[1]); }
+        if (out_fd) { dup2(po[1], 1); close(po[0]); close(po[1]); }
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    setpgid((pid_t)pid, (pid_t)pid);         // both sides set it: no kill-before-setpgid race
+    if (in_fd)  { close(pi[0]); *in_fd = pi[1]; }
+    if (out_fd) { close(po[1]); *out_fd = po[0]; fcntl(*out_fd, F_SETFL, O_NONBLOCK); }
+    return (int)pid;
+}
+
+static void mouth_start(void) {
+    if (!g_mouth_synth) return;
+    m_synth_pid = spawn_cmd(g_mouth_synth, &m_synth_in, &m_synth_out);
+    if (m_synth_pid < 0) { fprintf(stderr, "voicecat: mouth synth spawn failed\n"); g_mouth_synth = NULL; }
+}
+
+static void ring_add(const uint8_t *b, size_t n) {
+    if (m_rn + n > m_rcap) {
+        m_rcap = (m_rn + n) * 2 + 65536;
+        m_ring = realloc(m_ring, m_rcap);
+    }
+    memcpy(m_ring + m_rn, b, n);
+    m_rn += n;
+}
+
+// One chunk of the synth's mux stream through the frame parser: live 'P'
+// payload lands in the ring, an 'M' echo of our cut marker clears one mark,
+// all else ('C' config, 'A' schedules, stale 'P') falls through. Parser
+// state survives a cut — the stream's framing must stay intact whatever
+// the policy does.
+static void mux_feed(const uint8_t *b, size_t n) {
+    for (size_t i = 0; i < n; ) {
+        if (m_fr.hn < 5) {
+            size_t take = 5 - m_fr.hn;
+            if (take > n - i) take = n - i;
+            memcpy(m_fr.head + m_fr.hn, b + i, take);
+            m_fr.hn += (uint32_t)take;
+            i += take;
+            if (m_fr.hn == 5) {
+                m_fr.kind = m_fr.head[0];
+                memcpy(&m_fr.len, m_fr.head + 1, 4);
+                m_fr.got = 0;
+                m_fr.mn = 0;
+                if (m_fr.len == 0) m_fr.hn = 0;
+            }
+            continue;
+        }
+        size_t take = m_fr.len - m_fr.got;
+        if (take > n - i) take = n - i;
+        if (m_fr.kind == 'P' && m_marks_seen == m_marks_sent) ring_add(b + i, take);
+        if (m_fr.kind == 'M' || m_fr.kind == 'C')
+            for (size_t j = 0; j < take && m_fr.mn < sizeof m_fr.meta - 1; j++)
+                m_fr.meta[m_fr.mn++] = (char)b[i + j];
+        m_fr.got += (uint32_t)take;
+        i += take;
+        if (m_fr.got == m_fr.len) {
+            if (m_fr.kind == 'M') {
+                m_fr.meta[m_fr.mn] = 0;
+                if (strstr(m_fr.meta, M_MARK) && m_marks_seen < m_marks_sent) m_marks_seen++;
+            }
+            if (m_fr.kind == 'C') {                      // "rate=NNNNN\n": the horizon clock's unit
+                m_fr.meta[m_fr.mn] = 0;
+                const char *r = strstr(m_fr.meta, "rate=");
+                if (r && atoi(r + 5) > 0) m_rate = atoi(r + 5);
+            }
+            m_fr.hn = 0;
+        }
+    }
+}
+
+// Pump synth mux -> ring -> player. Called every mic tick: reads never block,
+// the player's pipe is written non-blocking with the ring holding the rest.
+static void mouth_pump(void) {
+    if (m_synth_out < 0) return;
+    uint8_t buf[8192];
+    int k;
+    while ((k = (int)read(m_synth_out, buf, sizeof buf)) > 0) {
+        m_last_pcm = now_sec();
+        mux_feed(buf, (size_t)k);
+    }
+    // escape hatch: a lost marker echo would mute the mouth for good; a
+    // long-idle synth means the stale tail has drained either way
+    if (m_marks_seen < m_marks_sent && now_sec() - m_last_pcm > 3.0) m_marks_seen = m_marks_sent;
+    if (m_rn == 0) return;
+    if (m_play_in < 0) {
+        m_play_pid = spawn_cmd(g_mouth_play, &m_play_in, NULL);
+        if (m_play_pid < 0) { fprintf(stderr, "voicecat: mouth player spawn failed\n"); m_rn = 0; return; }
+        fcntl(m_play_in, F_SETFL, O_NONBLOCK);
+    }
+    int k2 = (int)write(m_play_in, m_ring, m_rn > 65536 ? 65536 : m_rn);
+    if (k2 > 0) {
+        memmove(m_ring, m_ring + k2, m_rn - (size_t)k2);
+        m_rn -= (size_t)k2;
+        double base = m_audible_until > now_sec() ? m_audible_until : now_sec();
+        m_audible_until = base + (double)k2 / (double)(m_rate * 2);
+    }
+    else if (k2 < 0 && !wouldblock()) {      // player died underneath us
+        close(m_play_in); m_play_in = -1;
+        if (m_play_pid > 0) { kill(-(int)m_play_pid, SIGKILL); waitpid((int)m_play_pid, NULL, 0); m_play_pid = 0; }
+    }
+}
+
+// Barge: silence within the player's latency buffer. The synth lives on —
+// the marker line makes everything queued before it stale, drained unheard.
+// `mute` (a barged reply is still streaming) also eats the dying reply's
+// remaining clauses until its turn-end newline arrives.
+static void mouth_cut(int mute) {
+    if (!g_mouth_synth) return;
+    if (m_play_pid > 0) { kill(-(int)m_play_pid, SIGKILL); waitpid((int)m_play_pid, NULL, 0); m_play_pid = 0; }
+    if (m_play_in >= 0) { close(m_play_in); m_play_in = -1; }
+    m_rn = 0;
+    m_last_pcm = now_sec();
+    m_audible_until = now_sec() + 0.3;       // the cut lands within the sink's tail
+    memset(&m_cl, 0, sizeof m_cl);           // a half-built clause dies with the turn
+    m_mute_turn = mute;
+    if (m_synth_in >= 0) {
+        static const char mark[] =
+            "<|tool_call>call:set_voice{speaker_id:<|\"|>" M_MARK "<|\"|>}<tool_call|>\n";
+        if (write(m_synth_in, mark, sizeof mark - 1) == (int)(sizeof mark - 1))
+            m_marks_sent++;
+    }
+}
+
+static void mouth_close(void) {
+    if (!g_mouth_synth) return;
+    if (m_synth_in >= 0) { close(m_synth_in); m_synth_in = -1; }
+    double t0 = now_sec();                   // let the tail finish speaking, capped
+    while (now_sec() - t0 < 3.0) {
+        mouth_pump();
+        if (m_rn == 0 && now_sec() - m_last_pcm > 0.5) break;
+        msleep(20);
+    }
+    if (m_synth_pid > 0) { kill(-(int)m_synth_pid, SIGKILL); waitpid((int)m_synth_pid, NULL, 0); m_synth_pid = 0; }
+    if (m_play_pid > 0)  { kill(-(int)m_play_pid, SIGKILL); waitpid((int)m_play_pid, NULL, 0); m_play_pid = 0; }
+}
+
+static void m_flush_line(void) {
+    size_t a = 0, b = m_cl.ln;
+    while (a < b && (m_cl.line[a] == ' ' || m_cl.line[a] == '\t')) a++;
+    while (b > a && (m_cl.line[b - 1] == ' ' || m_cl.line[b - 1] == '\t')) b--;
+    if (b > a && m_synth_in >= 0) {
+        m_cl.line[b] = '\n';
+        if (write(m_synth_in, m_cl.line + a, b - a + 1) < 0 && !wouldblock())
+            fprintf(stderr, "voicecat: mouth synth pipe broke\n");
+    }
+    m_cl.ln = 0;
+}
+static int m_is_punct(char c) { return strchr(",;:.!?", c) != NULL; }
+static int m_is_after(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v' ||
+           c == '*' || c == ')' || c == '"' || c == '\'' || c == ']';
+}
+static void m_emit(char c) {
+    if (m_cl.ln > 0 && m_is_punct(m_cl.line[m_cl.ln - 1]) && m_is_after(c))
+        m_flush_line();
+    if (m_cl.ln < sizeof m_cl.line - 2) m_cl.line[m_cl.ln++] = c;
+}
+
+static void mouth_feed(const char *in, int n) {
+    if (!g_mouth_synth) return;
+    static const char CLOSE[] = "<channel|>", TCLOSE[] = "<tool_call|>";
+    for (int i = 0; i < n; i++) {
+        char c = in[i];
+        if (m_mute_turn) {                   // the barged reply's tail: unheard by design
+            if (c == '\n') { m_mute_turn = 0; memset(&m_cl, 0, sizeof m_cl); }
+            continue;
+        }
+        if (c == '\n') {                     // end of turn: pending '<...'/'[' was literal
+            if (!m_cl.thought && !m_cl.tcall) {
+                if (m_cl.pb) m_emit('[');
+                for (size_t j = 0; j < m_cl.tn; j++) m_emit(m_cl.tag[j]);
+            }
+            m_flush_line();
+            memset(&m_cl, 0, sizeof m_cl);
+            continue;
+        }
+        if (m_cl.thought) {
+            m_cl.cn = (c == CLOSE[m_cl.cn]) ? m_cl.cn + 1 : (c == CLOSE[0] ? 1 : 0);
+            if (m_cl.cn == sizeof CLOSE - 1) { m_cl.thought = 0; m_cl.cn = 0; }
+            continue;
+        }
+        if (m_cl.tcall) {                    // control spans drop whole here
+            m_cl.tcn = (c == TCLOSE[m_cl.tcn]) ? m_cl.tcn + 1 : (c == TCLOSE[0] ? 1 : 0);
+            if (m_cl.tcn == sizeof TCLOSE - 1) { m_cl.tcall = 0; m_cl.tcn = 0; }
+            continue;
+        }
+        if (m_cl.tn > 0) {                   // inside a potential <token>
+            if (c == '>') {
+                if (m_cl.tn == 1) { m_emit('<'); m_emit('>'); m_cl.tn = 0; continue; }
+                m_cl.tag[m_cl.tn] = 0;
+                if (!strcmp(m_cl.tag, "<|channel"))        m_cl.thought = 1;
+                else if (!strcmp(m_cl.tag, "<|tool_call")) m_cl.tcall = 1;
+                m_cl.tn = 0;
+                continue;
+            }
+            if (c != '<' && m_cl.tn < sizeof m_cl.tag - 2) { m_cl.tag[m_cl.tn++] = c; continue; }
+            for (size_t j = 0; j < m_cl.tn; j++) m_emit(m_cl.tag[j]);
+            m_cl.tn = 0;
+        }
+        if (m_cl.brk) {                      // [[...]] inline tags are control, not speech
+            if (c == ']' && m_cl.bn > 0 && m_cl.tsp[m_cl.bn - 1] == ']') { m_cl.brk = 0; m_cl.bn = 0; continue; }
+            if (m_cl.bn < sizeof m_cl.tsp - 1) { m_cl.tsp[m_cl.bn++] = c; continue; }
+            m_emit('['); m_emit('[');
+            for (size_t j = 0; j < m_cl.bn; j++) m_emit(m_cl.tsp[j]);
+            m_cl.brk = 0; m_cl.bn = 0;
+        }
+        if (m_cl.pb) {
+            m_cl.pb = 0;
+            if (c == '[') { m_cl.brk = 1; m_cl.bn = 0; continue; }
+            m_emit('[');
+        }
+        if (c == '[') { m_cl.pb = 1; continue; }
+        if (c == '<') { m_cl.tag[m_cl.tn++] = c; continue; }
+        m_emit(c);
+    }
+}
+// "Speaking" = the audible horizon hasn't passed (plus anything still in the
+// ring). NOT "a player process exists" (persistent player = deaf forever) and
+// NOT "the pump was recently active" (the synth outruns real time — the pump
+// idles while the downstream queue still holds half a minute). Both measured.
+static int mouth_speaking(void) {
+    return m_rn > 0 || now_sec() < m_audible_until;
+}
+#else
+static void mouth_start(void) {}
+static void mouth_pump(void)  {}
+static void mouth_cut(int mute) { (void)mute; }
+static void mouth_close(void) {}
+static void mouth_feed(const char *in, int n) { (void)in; (void)n; }
+static int  mouth_speaking(void) { return 0; }
+#endif
+
 // One received chunk: probe envelopes lifted out, the rest to stdout and the
 // turn matcher. A finished turn also clears the probe-inflight latch — the
 // socket is FIFO, so any probe answer would have arrived before the turn end.
@@ -442,8 +786,9 @@ static void deliver(const char *in, int k, int *pending, int *tstate) {
     char out[4096 + 16];
     int on = pf_feed(in, k, out);
     fwrite(out, 1, (size_t)on, stdout);
+    mouth_feed(out, on);
     int done = turn_ends(out, on, tstate);
-    while (done-- > 0) { (*pending)--; putchar('\n'); g_probe_inflight = 0; }
+    while (done-- > 0) { (*pending)--; putchar('\n'); mouth_feed("\n", 1); g_probe_inflight = 0; }
     fflush(stdout);
 }
 
@@ -772,6 +1117,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--realtime"))                      g_realtime = 1;
         else if (!strcmp(argv[i], "--whisper-model") && i + 1 < argc) g_whisper_model = argv[++i];
         else if (!strcmp(argv[i], "--whisper-bin") && i + 1 < argc)   g_whisper_bin = argv[++i];
+        else if (!strcmp(argv[i], "--whisper-url") && i + 1 < argc)   g_whisper_url = argv[++i];
+        else if (!strcmp(argv[i], "--mouth-synth") && i + 1 < argc)   g_mouth_synth = argv[++i];
+        else if (!strcmp(argv[i], "--mouth-play") && i + 1 < argc)    g_mouth_play = argv[++i];
+        else if (!strcmp(argv[i], "--hush-tail"))                     g_hush_tail = 1;
+        else if (!strcmp(argv[i], "--barge-mult") && i + 1 < argc)    g_barge_mult = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--barge-onset") && i + 1 < argc)   g_barge_onset = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--barge-note") && i + 1 < argc)    g_barge_note = argv[++i];
         else if (!strcmp(argv[i], "--commit-ms") && i + 1 < argc)     g_commit_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hang-ms") && i + 1 < argc)       g_hang_ms = atoi(argv[++i]);
@@ -789,11 +1140,20 @@ int main(int argc, char **argv) {
     if (!spath) {
         fprintf(stderr,
             "usage: voicecat <socket> [--mic FFMPEG_INPUT | --stdin-pcm [--realtime]]\n"
-            "                [--whisper-model FILE] [--whisper-bin PATH] [--barge-note TEXT]\n"
+            "                [--whisper-model FILE] [--whisper-bin PATH] [--whisper-url URL]\n"
+            "                [--barge-note TEXT] [--mouth-synth CMD --mouth-play CMD]\n"
             "                [--commit-ms N=2500] [--hang-ms N=700] [--vad-level N=400]\n"
             "                [--listener [--probe-ms N=1500] [--probe-gen N=6] [--probe-suffix TEXT]]\n"
             "  --mic        ffmpeg input spec (default \"-f alsa -i default\" on Linux)\n"
             "  --stdin-pcm  mono 16 kHz s16 PCM on stdin instead of a mic\n"
+            "  --whisper-url  POST passes to a resident whisper-server /inference instead\n"
+            "               of spawning whisper-cli — no model load per pass; with fast\n"
+            "               passes --commit-ms can drop to ~3x the measured pass cost\n"
+            "  --mouth-synth CMD   voicecat OWNS the TTS (POSIX): clause lines (clausecat's\n"
+            "  --mouth-play  CMD   policy, in-process) feed CMD's stdin (spawned once, kept\n"
+            "               warm); its PCM pumps into --mouth-play (respawned cheaply). A\n"
+            "               barge or speech over the reply's tail kills ONLY the player —\n"
+            "               the sound stops within its latency buffer\n"
             "  --realtime   pace stdin PCM at wall-clock rate, as a live mic would deliver it\n"
             "               (replay recordings realistically; a real mic paces itself)\n"
             "  --listener   probe the model while the user speaks (after commits and on\n"
@@ -811,7 +1171,16 @@ int main(int argc, char **argv) {
     }
     if (!g_whisper_model) g_whisper_model = getenv("LG_WHISPER_MODEL");
     if (!g_whisper_bin)   g_whisper_bin   = getenv("LG_WHISPER_BIN");
-    int whisper = g_whisper_model && *g_whisper_model;
+    if (!g_whisper_url)   g_whisper_url   = getenv("LG_WHISPER_URL");
+    if (g_whisper_url && !*g_whisper_url) g_whisper_url = NULL;
+    if ((g_mouth_synth != NULL) != (g_mouth_play != NULL)) {
+        fprintf(stderr, "voicecat: --mouth-synth and --mouth-play come as a pair\n");
+        return 1;
+    }
+#ifdef _WIN32
+    if (g_mouth_synth) { fprintf(stderr, "voicecat: --mouth-* is POSIX-only for now\n"); return 1; }
+#endif
+    int whisper = (g_whisper_model && *g_whisper_model) || g_whisper_url;
     if (!whisper)
         fprintf(stderr, "voicecat: no whisper model — native audio spans "
                         "(the model's ears work only while the session is vision-free)\n");
@@ -846,6 +1215,7 @@ int main(int argc, char **argv) {
     sock_t s = sock_connect(spath);            // before the main session occupies
     if (s == INVALID_SOCKET) { fprintf(stderr, "voicecat: connect to %s failed\n", spath); return 1; }
     if (g_memory) seed_memory(s);
+    mouth_start();
 
     int16_t frame[FR_SAMP], ring[PREROLL * FR_SAMP];
     int ring_n = 0;                                  // valid ticks in the preroll ring (rolls)
@@ -860,6 +1230,7 @@ int main(int argc, char **argv) {
     int in_utt = 0, onset = 0, sil_ms = 0, turn_open = 0, barged = 0, pause_probed = 0;
     int pending = 0, barge_armed = 1, tstate = 0;    // replies awaited; one barge per utterance
     char rbuf[4096];
+    double last_rx = now_sec();                      // last reply byte (pending-turn watchdog)
     double rt0 = 0; long rtn = 0;                    // --realtime deadline pacing
     double last_activity = now_sec();                // the idle clock (--idle-compress)
     int dirty = 0;                                   // turns exchanged since the last compress
@@ -883,8 +1254,19 @@ int main(int argc, char **argv) {
         for (;;) {
             int k = (int)recv(s, rbuf, sizeof rbuf, 0);
             if (k <= 0) break;
+            last_rx = now_sec();
             deliver(rbuf, k, &pending, &tstate);
         }
+        // a server that never answers must not deafen the ears forever: with
+        // pending stuck, the raised in-reply barge bar gates ALL speech — so
+        // give up on the turn, re-arm, and let the mouth machine reset
+        if (pending > 0 && now_sec() - last_rx > 60.0) {
+            fprintf(stderr, "voicecat: no reply in 60s — abandoning %d pending turn(s)\n", pending);
+            pending = 0;
+            barge_armed = 1;
+            mouth_feed("\n", 1);
+        }
+        mouth_pump();                                    // synth PCM -> ring -> player
 
         // the idle clock: any speech or reply in flight resets it; a long
         // enough quiet (and something worth remembering) compresses the session
@@ -899,20 +1281,27 @@ int main(int argc, char **argv) {
         if (!eof) {
             long long ss = 0;
             for (int i = 0; i < FR_SAMP; i++) ss += (long long)frame[i] * frame[i];
-            int voiced = (int)sqrt((double)ss / FR_SAMP) >= g_vad;
+            int rms = (int)sqrt((double)ss / FR_SAMP);
+            int voiced = rms >= g_vad;
 
             if (!in_utt) {
                 memmove(ring, ring + FR_SAMP, sizeof ring - sizeof frame);   // roll the preroll
                 memcpy(ring + (PREROLL - 1) * FR_SAMP, frame, sizeof frame);
                 if (ring_n < PREROLL) ring_n++;
-                onset = voiced ? onset + 1 : 0;
-                if (onset >= ONSET) {                    // an utterance begins
+                int busy = pending > 0 || mouth_speaking();
+                onset = (rms >= (busy ? g_vad * g_barge_mult : g_vad)) ? onset + 1 : 0;
+                if (onset >= (busy ? g_barge_onset : ONSET)) {   // an utterance begins
                     if (pending > 0 && barge_armed) {    // ...over the reply: barge
                         uint8_t b = LG_BARGE;
                         send_all(s, &b, 1);
-                        barged = 1; barge_armed = 0;
+                        mouth_cut(1);                    // the sound stops NOW, not when
+                        barged = 1; barge_armed = 0;     // the buffered clauses run out
                         fprintf(stderr, "voicecat: barge\n");
-                    }
+                    } else if (g_hush_tail && pending == 0 && mouth_speaking())
+                        mouth_cut(0);                    // speech over the reply's tail:
+                                                         // nothing to barge, still hush.
+                                                         // OPT-IN: without real AEC the
+                                                         // reply's own echo triggers it
                     ub_n = 0;
                     size_t pre = (size_t)ring_n * FR_SAMP;
                     if (ub_cap < pre + FR_SAMP) { ub_cap = 1 << 20; ub = realloc(ub, ub_cap * 2); }
@@ -1043,12 +1432,13 @@ int main(int argc, char **argv) {
                 int k = (int)recv(s, rbuf, sizeof rbuf, 0);
                 if (k > 0) deliver(rbuf, k, &pending, &tstate);
                 else if (k == 0) break;
-                else if (wouldblock()) msleep(10);
+                else if (wouldblock()) { mouth_pump(); msleep(10); }
                 else break;
             }
             break;
         }
     }
+    mouth_close();
     free(ub);
     sock_close(s);
     return 0;

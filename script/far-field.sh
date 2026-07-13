@@ -21,6 +21,12 @@ pidf=/tmp/far-field-service.pid
 here="$(cd "$(dirname "$0")" && pwd)"
 bin="$here/../build/far-field-service"
 [ -x "$bin" ] || bin=far-field-service
+src=alsa_input.usb-Seeed_Studio_ReSpeaker_Lite_0000000001-00.analog-stereo
+sink=alsa_output.usb-Seeed_Studio_ReSpeaker_Lite_0000000001-00.analog-stereo
+vol=75%                              # pinned BEFORE launch: the sink volume is
+                                     # part of the echo path the priming hiss
+                                     # teaches — changing it mid-session forces
+                                     # the canceller to re-converge
 
 alive() {
     [ -f "$pidf" ] && kill -0 "$(cat "$pidf" 2>/dev/null)" 2>/dev/null
@@ -34,9 +40,10 @@ start)
         exit 0
     fi
     rm -f "$sock"
+    pactl set-sink-volume "$sink" "$vol" 2>/dev/null
+    pactl set-source-volume "$src" 100% 2>/dev/null
     nohup "$bin" -s "$sock" \
-        --source alsa_input.usb-Seeed_Studio_ReSpeaker_Lite_0000000001-00.analog-stereo \
-        --sink   alsa_output.usb-Seeed_Studio_ReSpeaker_Lite_0000000001-00.analog-stereo \
+        --source "$src" --sink "$sink" \
         --channels 2 --use-channel 1 --pre-gain-db 12 --gain-db 16 \
         "$@" >"$log" 2>&1 &
     echo $! > "$pidf"

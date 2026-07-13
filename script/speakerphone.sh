@@ -6,8 +6,8 @@
 #
 # voicedemo.py's hardware sibling: the browser mic becomes a real one and
 # the AEC that a headset (or the browser's echoCancellation) used to provide
-# comes from PipeWire's webrtc canceller, wired by respeaker-aec.sh — TTS
-# plays into ec_sink, the mic is read from ec_src, and what the speaker
+# comes from far-field-service (see docs/far-field-service.md) — the ears
+# are its clean tap, the mouth is its --speak client, and what the speaker
 # says is subtracted from what the mic hears, so the turn-taker can keep
 # the mic open while the reply plays.
 #

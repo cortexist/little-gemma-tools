@@ -50,12 +50,20 @@ u32 len}` + payload. A client's first frame declares what it is:
 |---|---|
 | `e` (ears) | a tap; `w=1` asks for the raw pre-cancel channel |
 | `m` (mouth) | the speaker's owner; payload `rate=NNNNN` — one mouth at a time |
+| `c` (control) | duck/restore frames follow until hangup |
 
 Then a mouth streams `P` frames (s16 mono PCM at its declared rate —
 resampled here once, played, and fed to the canceller as reference), may
 send `F` to flush, and `D` to drain: the service plays out what is queued,
 waits the sink's tail, and acks one byte. Taps just read `P` frames of
-16 kHz s16 mono.
+16 kHz s16 mono. A control client sends `d` (duck: playback drops
+`--duck-db`, default 12, ramped across one block — and the canceller's
+reference is taken AFTER the duck, so it costs zero re-convergence) and
+`u` (restore); a dead controller restores automatically. This is the
+two-stage barge's stage one: voicecat ducks at speech onset over a reply,
+cuts only when words materialize, and un-ducks when a door slam or cough
+comes to nothing — the reply swells back unharmed (`--duck-sock` in
+voicecat; both paths verified acoustically on the monitor).
 
 **A mouth hanging up WITHOUT draining is the cut.** Everything it queued is
 dropped and the sound stops within the sink's ~100 ms tail. This is not an

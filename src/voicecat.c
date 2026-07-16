@@ -84,6 +84,13 @@ static int g_commit_ms = 2500, g_hang_ms = 700, g_vad = 400, g_realtime = 0;
 // open an utterance is HIGHER and LONGER — the browser demo's BARGE_THRESH
 // rule: echo residuals and AEC startup transients must not cut the mouth.
 static int g_barge_mult = 2, g_barge_onset = 6;
+// --duck-sock: TWO-STAGE barge via far-field-service's control channel.
+// Stage 1, at onset: the reply DUCKS (drops --duck-db, keeps playing) —
+// instant, and cheap to undo. Stage 2, when words MATERIALIZE (first
+// streamed commit, or a non-empty final transcript): the real cut + the
+// barge turn. A door slam or a cough ducks the voice for a second and
+// then it swells back — never a turn, never a dangling half-reply.
+static const char *g_duck_sock = NULL;
 
 static double now_sec(void) {
     struct timespec ts;
@@ -792,6 +799,18 @@ static void deliver(const char *in, int k, int *pending, int *tstate) {
     fflush(stdout);
 }
 
+// The duck line to far-field-service: hello 'c' once, then 'd'/'u' frames.
+static sock_t g_duck_fd = INVALID_SOCKET;
+static void duck_hdr(uint8_t type) {
+    if (g_duck_fd == INVALID_SOCKET) return;
+    uint8_t hdr[LG_FRAME_HDR] = { LG_FRAME_MAGIC, type };
+    if (send_all(g_duck_fd, hdr, sizeof hdr) != 0) {
+        sock_close(g_duck_fd);                       // service gone: fall back to
+        g_duck_fd = INVALID_SOCKET;                  // single-stage cuts
+    }
+}
+static void duck_set(int on) { duck_hdr(on ? 'd' : 'u'); }
+
 static sock_t sock_connect(const char *spath) {
     struct sockaddr_un sa;
     memset(&sa, 0, sizeof sa);
@@ -1123,6 +1142,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--hush-tail"))                     g_hush_tail = 1;
         else if (!strcmp(argv[i], "--barge-mult") && i + 1 < argc)    g_barge_mult = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--barge-onset") && i + 1 < argc)   g_barge_onset = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--duck-sock") && i + 1 < argc)     g_duck_sock = argv[++i];
         else if (!strcmp(argv[i], "--barge-note") && i + 1 < argc)    g_barge_note = argv[++i];
         else if (!strcmp(argv[i], "--commit-ms") && i + 1 < argc)     g_commit_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hang-ms") && i + 1 < argc)       g_hang_ms = atoi(argv[++i]);
@@ -1154,6 +1174,9 @@ int main(int argc, char **argv) {
             "               warm); its PCM pumps into --mouth-play (respawned cheaply). A\n"
             "               barge or speech over the reply's tail kills ONLY the player —\n"
             "               the sound stops within its latency buffer\n"
+            "  --duck-sock PATH    two-stage barge via far-field-service: onset DUCKS the\n"
+            "               reply (it keeps playing, quieter); the cut waits for words to\n"
+            "               materialize; a false alarm swells the reply back unharmed\n"
             "  --realtime   pace stdin PCM at wall-clock rate, as a live mic would deliver it\n"
             "               (replay recordings realistically; a real mic paces itself)\n"
             "  --listener   probe the model while the user speaks (after commits and on\n"
@@ -1216,6 +1239,13 @@ int main(int argc, char **argv) {
     if (s == INVALID_SOCKET) { fprintf(stderr, "voicecat: connect to %s failed\n", spath); return 1; }
     if (g_memory) seed_memory(s);
     mouth_start();
+    if (g_duck_sock) {
+        g_duck_fd = sock_connect(g_duck_sock);
+        if (g_duck_fd == INVALID_SOCKET)
+            fprintf(stderr, "voicecat: --duck-sock %s unreachable — single-stage barge\n", g_duck_sock);
+        else
+            duck_hdr('c');                           // the control hello
+    }
 
     int16_t frame[FR_SAMP], ring[PREROLL * FR_SAMP];
     int ring_n = 0;                                  // valid ticks in the preroll ring (rolls)
@@ -1228,6 +1258,7 @@ int main(int argc, char **argv) {
     size_t last_pass = 0;                            // ub_n at the previous whisper pass
     size_t last_voice = 0;                           // ub_n at the last voiced frame
     int in_utt = 0, onset = 0, sil_ms = 0, turn_open = 0, barged = 0, pause_probed = 0;
+    int duck_pending = 0;                            // a stage-1 duck awaiting words
     int pending = 0, barge_armed = 1, tstate = 0;    // replies awaited; one barge per utterance
     char rbuf[4096];
     double last_rx = now_sec();                      // last reply byte (pending-turn watchdog)
@@ -1291,7 +1322,11 @@ int main(int argc, char **argv) {
                 int busy = pending > 0 || mouth_speaking();
                 onset = (rms >= (busy ? g_vad * g_barge_mult : g_vad)) ? onset + 1 : 0;
                 if (onset >= (busy ? g_barge_onset : ONSET)) {   // an utterance begins
-                    if (pending > 0 && barge_armed) {    // ...over the reply: barge
+                    if (busy && g_duck_fd != INVALID_SOCKET) {   // stage 1: duck, keep
+                        duck_set(1);                     // talking — the cut waits for
+                        duck_pending = 1;                // words to materialize
+                        fprintf(stderr, "voicecat: barge? ducked\n");
+                    } else if (pending > 0 && barge_armed) {   // ...over the reply: barge
                         uint8_t b = LG_BARGE;
                         send_all(s, &b, 1);
                         mouth_cut(1);                    // the sound stops NOW, not when
@@ -1337,6 +1372,17 @@ int main(int argc, char **argv) {
                         int agree = agree_words(prev, cur);
                         int local = committed - trimmed;             // sent words still in the window
                         if (agree > local) {
+                            if (duck_pending) {          // stage 2: words materialized —
+                                if (pending > 0 && barge_armed) {   // commit the barge for real
+                                    uint8_t bb = LG_BARGE;
+                                    send_all(s, &bb, 1);
+                                    barge_armed = 0;
+                                }
+                                mouth_cut(pending > 0);
+                                duck_set(0);             // post-cut audio plays at full level
+                                barged = 1; duck_pending = 0;
+                                fprintf(stderr, "voicecat: barge confirmed\n");
+                            }
                             size_t a = after_word(cur, local), b = after_word(cur, agree);
                             while (cur[a] == ' ') a++;
                             char piece[8192];
@@ -1401,6 +1447,17 @@ int main(int argc, char **argv) {
                 if (ok) {
                     size_t a = after_word(cur, committed - trimmed);
                     while (cur[a] == ' ') a++;
+                    if (duck_pending && (turn_open || cur[a])) {     // stage 2 at the close:
+                        if (pending > 0 && barge_armed) {            // short real interruptions
+                            uint8_t bb = LG_BARGE;                   // materialize here, not
+                            send_all(s, &bb, 1);                     // at a streamed commit
+                            barge_armed = 0;
+                        }
+                        mouth_cut(pending > 0);
+                        duck_set(0);
+                        barged = 1; duck_pending = 0;
+                        fprintf(stderr, "voicecat: barge confirmed\n");
+                    }
                     if (turn_open || cur[a] || barged)   // never a clock-only turn
                         snprintf(line, sizeof line, "%s%s%s", !turn_open ? turn_clock() : "",
                                  !turn_open && barged ? g_barge_note : "", cur + a);
@@ -1412,8 +1469,24 @@ int main(int argc, char **argv) {
                     send_all(s, line, L + 1);
                     pending++; barge_armed = 1; barged = 0; dirty = 1; g_last_close = now_sec();
                     fprintf(stderr, "voicecat: turn closed (%d+ words)\n", committed);
-                }
+                } else if (barged || duck_pending) {     // the barge came to nothing (a door,
+                    if (duck_pending) duck_set(0);       // a cough): un-duck — the reply SWELLS
+                    duck_pending = 0;                    // BACK and keeps talking; a hard-cut
+                    barged = 0; barge_armed = 1;         // false alarm just stays quiet. Either
+                    fprintf(stderr, "voicecat: barge came to nothing\n");   // way the next real
+                }                                        // turn is NOT an interruption
             } else if (ub_n >= LG_RATE / 2) {            // native span; drop sub-0.5s blips
+                if (duck_pending) {                      // a real half-second of audio IS
+                    if (pending > 0 && barge_armed) {    // materialization on this path
+                        uint8_t bb = LG_BARGE;
+                        send_all(s, &bb, 1);
+                        barge_armed = 0;
+                    }
+                    mouth_cut(pending > 0);
+                    duck_set(0);
+                    barged = 1; duck_pending = 0;
+                    fprintf(stderr, "voicecat: barge confirmed\n");
+                }
                 size_t pad = (LG_FRAME - ub_n % LG_FRAME) % LG_FRAME;
                 if (ub_n + pad > ub_cap) { ub_cap = ub_n + pad; ub = realloc(ub, ub_cap * 2); }
                 memset(ub + ub_n, 0, pad * 2);
@@ -1424,6 +1497,11 @@ int main(int argc, char **argv) {
                 send_all(s, "\n", 1);
                 pending++; barge_armed = 1; dirty = 1; g_last_close = now_sec();
                 fprintf(stderr, "voicecat: turn closed (%.1fs audio)\n", (double)ub_n / LG_RATE);
+            } else if (barged || duck_pending) {         // a sub-0.5s barge blip: same false alarm
+                if (duck_pending) duck_set(0);
+                duck_pending = 0;
+                barged = 0; barge_armed = 1;
+                fprintf(stderr, "voicecat: barge came to nothing\n");
             }
         }
 

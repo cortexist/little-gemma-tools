@@ -95,10 +95,13 @@ echo "speakerphone: talk when ready (ctrl-c to stop)" >&2
 # noise, not echo — a firm word interrupts. (An earlier 4×/8 bar, set before
 # the gate proved itself, was unreachable on this deaf channel: barge never
 # fired and the reply just played out.)
+# --duck-sock: two-stage barge — speech over the reply first DUCKS it (it
+# keeps talking, 12 dB down); the hard cut waits for words to materialize,
+# and a door slam or cough swells the reply back instead of killing it.
 "$tools/far-field-service" --tap "$ffsock" \
   | "$vc" "$sock" --stdin-pcm \
       --vad-level 150 --hang-ms 500 --clock 0 --hush-tail \
-      --barge-mult 2 --barge-onset 5 \
+      --barge-mult 2 --barge-onset 5 --duck-sock "$ffsock" \
       --whisper-url "$wurl" --commit-ms 1100 \
       --mouth-synth "$piper -m $LG_VOICE --output-mux --stream" \
       --mouth-play  "$tools/far-field-service --speak $ffsock --rate $rate"

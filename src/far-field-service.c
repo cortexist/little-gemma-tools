@@ -51,13 +51,18 @@
 
 #define FF_EARS  'e'
 #define FF_MOUTH 'm'
+#define FF_CTRL  'c'                     // a control client: duck/restore frames follow
 #define FF_PCM   'P'
 #define FF_FLUSH 'F'
 #define FF_DRAIN 'D'                     // "I'm done": play out, then ack one byte —
                                          // hangup WITHOUT it is a cut (the barge)
+#define FF_DUCK  'd'                     // stage-1 barge: playback drops --duck-db,
+#define FF_REST  'u'                     // keeps playing; 'u' (or ctrl hangup) restores
 
 static const char *g_source = NULL, *g_sink = NULL;
 static int    g_channels = 1, g_use_ch = 0, g_no_aec = 0;
+static double g_duck_gain = 0.25;            // --duck-db (default 12): stage-1 barge level
+static volatile double g_duck = 1.0;         // current target; the duplex loop ramps to it
 static double g_gain = 1.0;                  // after the canceller: lifts for VAD/ASR
 static double g_pre_gain = 1.0;              // before it: a deaf channel's echo must
                                              // reach AEC3's working range — but stay
@@ -190,6 +195,18 @@ static void *duplex_main(void *arg) {
         }
         pthread_mutex_unlock(&m_mx);
         if (!have) memset(block, 0, sizeof block);
+        // the duck: ramp the gain across the block (a 12 dB step would click)
+        // and scale BEFORE the canceller's reference — it must hear exactly
+        // what plays, so ducking costs zero re-convergence
+        static double dcur = 1.0;
+        double dtgt = g_duck;
+        if (have && (dcur != 1.0 || dtgt != 1.0)) {
+            for (int i = 0; i < BLOCK; i++) {
+                double gg = dcur + (dtgt - dcur) * i / BLOCK;
+                block[i] = (int16_t)(block[i] * gg);
+            }
+        }
+        dcur = dtgt;
         if (!g_no_aec) aec_ref(g_aec, block, BLOCK);
         pa_simple_write(g_play, block, sizeof block, &err);
         // near leg: pick, pre-gain (bounded), cancel, post-gain
@@ -250,6 +267,15 @@ static void *client_main(void *arg) {
         if (len) { close(fd); return NULL; }
         tap_add(fd, w == 1);
         return NULL;                                 // capture thread owns it now
+    }
+    if (hdr[1] == FF_CTRL) {                         // duck/restore frames until hangup;
+        while (read_full(fd, hdr, sizeof hdr) == 0 && hdr[0] == LG_FRAME_MAGIC) {
+            if (hdr[1] == FF_DUCK) g_duck = g_duck_gain;
+            else if (hdr[1] == FF_REST) g_duck = 1.0;
+        }
+        g_duck = 1.0;                                // a dead controller never leaves it ducked
+        close(fd);
+        return NULL;
     }
     if (hdr[1] != FF_MOUTH || len > 64) { close(fd); return NULL; }
     char cfg[65] = "";
@@ -401,6 +427,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--use-channel") && i + 1 < argc)  g_use_ch = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gain-db") && i + 1 < argc)      g_gain = pow(10.0, atof(argv[++i]) / 20.0);
         else if (!strcmp(argv[i], "--pre-gain-db") && i + 1 < argc)  g_pre_gain = pow(10.0, atof(argv[++i]) / 20.0);
+        else if (!strcmp(argv[i], "--duck-db") && i + 1 < argc)      g_duck_gain = pow(10.0, -atof(argv[++i]) / 20.0);
         else if (!strcmp(argv[i], "--no-aec"))                       g_no_aec = 1;
         else {
             fprintf(stderr, "far-field-service: unknown argument %s\n", argv[i]);

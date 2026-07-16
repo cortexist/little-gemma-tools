@@ -232,7 +232,10 @@ open-air mic without it will barge on its own TTS. Whisper must run faster
 than real time (tiny/base on a GPU), or commits fall behind capture. While a
 reply is audible, the bar to open an utterance is higher and longer
 (`--barge-mult`, `--barge-onset` — the browser demo's rule), so echo
-residue can't cut the mouth but a firm voice can.
+residue can't cut the mouth but a firm voice can. With `--duck-sock` the
+barge is TWO-STAGE: onset ducks the reply (12 dB down, still talking), the
+hard cut waits for words to materialize, and a false alarm — a door, a
+cough — swells the reply back instead of killing it.
 
 ### The mouth, owned (`--mouth-synth` / `--mouth-play`)
 

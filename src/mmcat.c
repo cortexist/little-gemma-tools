@@ -137,7 +137,16 @@ static size_t read_full(FILE *f, void *buf, size_t n) {
     return got;
 }
 
-struct probe { int has_video, has_audio, vw, vh; double duration; };
+struct probe { int has_video, has_audio, vw, vh; double duration; char format[64]; };
+
+// Is this ffprobe format_name a still-image demuxer? Needed because a still does
+// NOT reliably report "no duration": ffprobe hands a .jpg to the image2 demuxer,
+// which synthesizes duration=0.040000 — one frame at the default 25 fps. Only
+// .png (png_pipe) reports N/A, which is why "duration > 0.0 means video" appeared
+// to work and silently misread every photo as a 0.04-second video.
+static int is_still_fmt(const char *fmt) {
+    return fmt && *fmt && (strstr(fmt, "image2") || strstr(fmt, "_pipe"));
+}
 
 static int probe_file(const char *path, struct probe *p) {
     memset(p, 0, sizeof *p);
@@ -155,9 +164,22 @@ static int probe_file(const char *path, struct probe *p) {
         }
     }
     pclose(f);
-    snprintf(cmd, sizeof cmd, "ffprobe -v error -show_entries format=duration -of csv=p=0 \"%s\"", path);
+    // key=value form (default=nw=1), so the fields can't be swapped on us the way
+    // a bare csv row can. format_name is what tells a photo from a clip; duration
+    // alone cannot (see is_still_fmt).
+    snprintf(cmd, sizeof cmd,
+        "ffprobe -v error -show_entries format=format_name,duration -of default=nw=1 \"%s\"", path);
     f = run_pipe(cmd);
-    if (f) { if (fgets(line, sizeof line, f)) p->duration = atof(line); pclose(f); }
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if (!strncmp(line, "duration=", 9)) p->duration = atof(line + 9);
+            else if (!strncmp(line, "format_name=", 12)) {
+                snprintf(p->format, sizeof p->format, "%s", line + 12);
+                p->format[strcspn(p->format, "\r\n")] = 0;
+            }
+        }
+        pclose(f);
+    }
     return 0;
 }
 
@@ -346,7 +368,11 @@ static int process_file(sock_t s, const char *path) {
     struct probe p;
     if (probe_file(path, &p) != 0) return -1;
     if (!p.has_video && !p.has_audio) { fprintf(stderr, "mmcat: %s: no decodable media stream\n", path); return -1; }
-    int is_video = p.has_video && p.duration > 0.0;   // a still image reports no/zero duration
+    // A still is a still even when ffprobe invents a duration for it (image2 gives a
+    // .jpg 0.04s). Ask the demuxer, not the clock — otherwise every photo took the
+    // video path: `-vf fps=1` over a 0.04s "clip" decodes ZERO frames, so the image
+    // silently never went, and the " downsampled video" tag went in its place.
+    int is_video = p.has_video && p.duration > 0.0 && !is_still_fmt(p.format);
 
     if (p.has_video && !g_no_video) {
         int budget = (is_video && !g_budget_set) ? VIDEO_TOK : g_budget;   // auto-low for video

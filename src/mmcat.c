@@ -85,22 +85,28 @@ static int g_segs = 0;                       // spans sent this turn; must stay 
 static int room_for(int n) { return g_segs + n <= LG_MAX_SEG; }
 static int whisper_on(void) { return g_whisper_model && *g_whisper_model && !g_no_whisper; }
 
-// ---- geometry: resized (W,H), each side a PATCH multiple, <= budget patches,
-//      aspect preserved. Byte-identical to the runner's media_cat target_size. ----
+// ---- geometry: Gemma 4's canonical aspect-preserving resize ------------------
+// Matches Google's official gemma4_vision_token_budget visualizer exactly: scale
+// the image so its 48px-grid cell count lands on the budget, then floor-snap each
+// side to the grid. LG_PATCH = 48 = P(16) * K(3): one text token per 48x48 block.
+// floor guarantees (ow/48)*(oh/48) <= budget, so the token count is capped by
+// construction, no explicit min() needed.
+//
+// The scale factor is applied UNCONDITIONALLY. Real camera frames are far above
+// any budget, so f < 1 and this always downscales — and there the old cap-only
+// form was already identical (same floor, same scale). The change is only for
+// small/synthetic frames: they now scale UP to fill the budget, which is what the
+// budget buys and what the reference does, instead of keeping a sparse native
+// grid. (This replaces the earlier "budget is a strict max, never upscale" rule;
+// the now-canonical Google resize scales to the budget in both directions.)
 static void target_size(int w, int h, int budget, int *ow, int *oh) {
-    const float fa = (float)LG_PATCH;
-    const long long max_px = (long long)budget * LG_PATCH * LG_PATCH;
-    int wb = (int)roundf((float)w / fa) * LG_PATCH, hb = (int)roundf((float)h / fa) * LG_PATCH;
-    if (wb < LG_PATCH) wb = LG_PATCH;
-    if (hb < LG_PATCH) hb = LG_PATCH;
-    if ((long long)wb * hb > max_px) {
-        float beta = sqrtf((float)h * (float)w / (float)max_px);
-        wb = (int)floorf((float)w / beta / fa) * LG_PATCH;
-        hb = (int)floorf((float)h / beta / fa) * LG_PATCH;
-        if (wb < LG_PATCH) wb = LG_PATCH;
-        if (hb < LG_PATCH) hb = LG_PATCH;
-    }
-    *ow = wb; *oh = hb;
+    const double m = (double)LG_PATCH;                              // 48
+    double f = sqrt((double)budget * m * m / ((double)w * (double)h));
+    int wt = (int)floor(f * (double)w / m) * LG_PATCH;
+    int ht = (int)floor(f * (double)h / m) * LG_PATCH;
+    if (wt < LG_PATCH) wt = LG_PATCH;
+    if (ht < LG_PATCH) ht = LG_PATCH;
+    *ow = wt; *oh = ht;
 }
 
 // ---- the wire ----------------------------------------------------------------

@@ -21,9 +21,9 @@ pidf=/tmp/far-field-service.pid
 here="$(cd "$(dirname "$0")" && pwd)"
 bin="$here/../build/far-field-service"
 [ -x "$bin" ] || bin=far-field-service
-src=alsa_input.usb-Seeed_Studio_ReSpeaker_Lite_0000000001-00.analog-stereo
-sink=alsa_output.usb-Seeed_Studio_ReSpeaker_Lite_0000000001-00.analog-stereo
-vol=75%                              # pinned BEFORE launch: the sink volume is
+src=alsa_input.usb-Seeed_Studio_reSpeaker_Flex_XVF3800_C16K6Ch_100005504261800275-00.multichannel-input
+sink=alsa_output.usb-Seeed_Studio_reSpeaker_Flex_XVF3800_C16K6Ch_100005504261800275-00.analog-stereo
+vol=100%                              # pinned BEFORE launch: the sink volume is
                                      # part of the echo path the priming hiss
                                      # teaches — changing it mid-session forces
                                      # the canceller to re-converge
@@ -44,7 +44,7 @@ start)
     pactl set-source-volume "$src" 100% 2>/dev/null
     nohup "$bin" -s "$sock" \
         --source "$src" --sink "$sink" \
-        --channels 2 --use-channel 1 --pre-gain-db 12 --gain-db 16 \
+        --channels 6 --use-channel 1 --gain-db 12 --no-aec \
         "$@" >"$log" 2>&1 &
     echo $! > "$pidf"
     for i in 1 2 3 4 5 6 7 8 9 10; do

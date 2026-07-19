@@ -90,7 +90,7 @@ echo "speakerphone: talk when ready (ctrl-c to stop)" >&2
 # reply's tail is the user, not the echo.
 # --clock 0: E2B parrots the "[18:52]" turn-clock into speech (E4B+ uses it
 # silently as taught); keep time awareness off below the finetune boundary.
-# --barge-mult 2 / onset 5: AEC3's output gate holds the TTS residual near
+# --barge-mult 8 / onset 5: AEC3's output gate holds the TTS residual near
 # the noise floor (measured −78 dB), so the in-reply bar only needs to clear
 # noise, not echo — a firm word interrupts. (An earlier 4×/8 bar, set before
 # the gate proved itself, was unreachable on this deaf channel: barge never
@@ -100,8 +100,8 @@ echo "speakerphone: talk when ready (ctrl-c to stop)" >&2
 # and a door slam or cough swells the reply back instead of killing it.
 "$tools/far-field-service" --tap "$ffsock" \
   | "$vc" "$sock" --stdin-pcm \
-      --vad-level 150 --hang-ms 500 --clock 0 --hush-tail \
-      --barge-mult 2 --barge-onset 5 --duck-sock "$ffsock" \
+      --vad-level 200 --hang-ms 500 --clock 0 --hush-tail \
+      --barge-mult 8 --barge-onset 15 --duck-sock "$ffsock" \
       --whisper-url "$wurl" --commit-ms 1100 \
       --mouth-synth "$piper -m $LG_VOICE --output-mux --stream" \
       --mouth-play  "$tools/far-field-service --speak $ffsock --rate $rate"

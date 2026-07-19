@@ -8,3 +8,7 @@ build/
 .scratch/
 .claude/
 __pycache__/
+# build binaries in the repo root
+/voicecat
+/clausecat
+script/__pycache__/

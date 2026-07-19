@@ -80,6 +80,17 @@ static const char *g_barge_note = "(interrupting) ";
 // base.en via whisper-cli, process+model load included) or passes stack up
 // and the loop falls behind real time: keep commit_ms >= 3x the pass cost.
 static int g_commit_ms = 2500, g_hang_ms = 700, g_vad = 400, g_realtime = 0;
+// --max-utt SEC: force-close an utterance once its window reaches this many
+// seconds. The window is TRIMMED as whisper confirms words, so fluent speech
+// stays small (a few seconds) no matter how long you talk and NEVER hits the
+// cap — only audio whisper can't turn into words (continuous non-speech, e.g.
+// music) grows the window unbounded. So the cap is speech-safe by construction:
+// it can only fire on non-speech, bounding the buffer and freeing the loop to
+// respond over a sustained sound. 0 = off.
+static int g_max_utt = 15;
+// --sound-tags: pass whisper's non-speech tags ([Music], (typing)) to the model.
+// OFF by default — E2B narrates every sound. On, for a model that can govern it.
+static int g_sound_tags = 0;
 // While a reply is live (pending, or the mouth still sounding) the bar to
 // open an utterance is HIGHER and LONGER — the browser demo's BARGE_THRESH
 // rule: echo residuals and AEC startup transients must not cut the mouth.
@@ -292,13 +303,17 @@ static size_t parse_ts(const char *p) {                  // "hh:mm:ss.mmm" -> sa
     return (size_t)(((h * 60 + m) * 60 + sec) * LG_RATE);
 }
 
-// Append one transcript line/segment to `out`: [..] (..) tags stripped whole,
-// whitespace folded, a trailing space closes the last word. `w` = bytes in
-// out, `words` = completed words — both run cumulatively across calls.
+// Append one transcript line/segment to `out`: by DEFAULT whisper's non-speech
+// tags ([Music], (typing), [BLANK_AUDIO]) are STRIPPED. Passing them to the model
+// made a small model (E2B) narrate every ambient sound — it won't obey "note it
+// but stay silent". `--sound-tags` keeps them, for a model/cognition layer that
+// CAN govern its reactions. Timestamp headers are stripped upstream (both parse
+// paths). Whitespace folded, a trailing space closes the last word. `w` = bytes,
+// `words` = completed words — both cumulative across calls.
 static void words_add(const char *text, char *out, size_t *w, size_t cap, int *words) {
     for (size_t i = 0; text[i]; ) {
         char c = text[i];
-        if (c == '[' || c == '(') {
+        if (!g_sound_tags && (c == '[' || c == '(')) {   // drop a non-speech tag whole
             char close = c == '[' ? ']' : ')';
             while (text[i] && text[i] != close) i++;
             if (text[i]) i++;
@@ -1146,6 +1161,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--barge-note") && i + 1 < argc)    g_barge_note = argv[++i];
         else if (!strcmp(argv[i], "--commit-ms") && i + 1 < argc)     g_commit_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hang-ms") && i + 1 < argc)       g_hang_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--max-utt") && i + 1 < argc)       g_max_utt = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--sound-tags"))                    g_sound_tags = 1;
         else if (!strcmp(argv[i], "--vad-level") && i + 1 < argc)     g_vad = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--listener"))                      g_listener = 1;
         else if (!strcmp(argv[i], "--probe-ms") && i + 1 < argc)      g_probe_ms = atoi(argv[++i]);
@@ -1162,7 +1179,7 @@ int main(int argc, char **argv) {
             "usage: voicecat <socket> [--mic FFMPEG_INPUT | --stdin-pcm [--realtime]]\n"
             "                [--whisper-model FILE] [--whisper-bin PATH] [--whisper-url URL]\n"
             "                [--barge-note TEXT] [--mouth-synth CMD --mouth-play CMD]\n"
-            "                [--commit-ms N=2500] [--hang-ms N=700] [--vad-level N=400]\n"
+            "                [--commit-ms N=2500] [--hang-ms N=700] [--max-utt N=15] [--vad-level N=400] [--sound-tags]\n"
             "                [--listener [--probe-ms N=1500] [--probe-gen N=6] [--probe-suffix TEXT]]\n"
             "  --mic        ffmpeg input spec (default \"-f alsa -i default\" on Linux)\n"
             "  --stdin-pcm  mono 16 kHz s16 PCM on stdin instead of a mic\n"
@@ -1432,9 +1449,17 @@ int main(int argc, char **argv) {
             }
         }
 
-        // end of the utterance: trailing silence, or the source ran dry
-        if (in_utt && (sil_ms >= g_hang_ms || eof)) {
+        // end of the utterance: trailing silence, the source ran dry, or the
+        // window grew past --max-utt without whisper trimming it (continuous
+        // non-speech held the turn open — see g_max_utt). Fluent speech trims
+        // as it confirms so its window never reaches the cap; this only fires
+        // on non-speech, so it can't cut a real utterance mid-word.
+        int max_utt_hit = g_max_utt > 0 && ub_n >= (size_t)g_max_utt * LG_RATE;
+        if (in_utt && (sil_ms >= g_hang_ms || eof || max_utt_hit)) {
             in_utt = 0;
+            if (max_utt_hit)
+                fprintf(stderr, "voicecat: max-utt cap (%.0fs unconfirmed audio) — closing\n",
+                        (double)ub_n / LG_RATE);
             if (whisper) {
                 char line[8192] = "";
                 // The final pass runs over the TRIMMED window — the unconfirmed
@@ -1462,7 +1487,7 @@ int main(int argc, char **argv) {
                         snprintf(line, sizeof line, "%s%s%s", !turn_open ? turn_clock() : "",
                                  !turn_open && barged ? g_barge_note : "", cur + a);
                 }
-                if (turn_open || line[0]) {              // silence/false trigger sends nothing
+                if (turn_open || barged) {               // >=1 word survived the two-pass agreement (turn_open) or a barge — a lone final-pass guess on noise (no agreement) is dropped, killing the ambient-noise 0-word reply storm
                     size_t L = strlen(line);
                     if (L > sizeof line - 2) L = sizeof line - 2;
                     line[L] = '\n'; line[L + 1] = 0;

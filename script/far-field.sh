@@ -44,7 +44,7 @@ start)
     pactl set-source-volume "$src" 100% 2>/dev/null
     nohup "$bin" -s "$sock" \
         --source "$src" --sink "$sink" \
-        --channels 6 --use-channel 1 --gain-db 12 --no-aec \
+        --channels 6 --use-channel 1 --gain-db 12 --scene \
         "$@" >"$log" 2>&1 &
     echo $! > "$pidf"
     for i in 1 2 3 4 5 6 7 8 9 10; do

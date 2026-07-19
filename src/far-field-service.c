@@ -37,6 +37,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <pulse/simple.h>
@@ -48,6 +49,9 @@
 #define RATE   16000
 #define BLOCK  160                       // 10 ms — the canceller's frame
 #define MAXTAP 8
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 #define FF_EARS  'e'
 #define FF_MOUTH 'm'
@@ -60,7 +64,7 @@
 #define FF_REST  'u'                     // keeps playing; 'u' (or ctrl hangup) restores
 
 static const char *g_source = NULL, *g_sink = NULL;
-static int    g_channels = 1, g_use_ch = 0, g_no_aec = 0;
+static int    g_channels = 1, g_use_ch = 0, g_no_aec = 0, g_scene = 0;
 static double g_duck_gain = 0.25;            // --duck-db (default 12): stage-1 barge level
 static volatile double g_duck = 1.0;         // current target; the duplex loop ramps to it
 static double g_gain = 1.0;                  // after the canceller: lifts for VAD/ASR
@@ -141,6 +145,171 @@ static void mouth_flush(void) {
 // pacing jitters against fat capture fragments, and pa_simple_flush jumps
 // the playback clock — hence also: the cut clears only the queue, and both
 // streams run with tight buffer_attr forever.
+// ---- acoustic scene: DoA + source tracking (--scene, stage 1) -------------------
+// The 4 raw mics (channels 2..5 of the XVF3800 6-ch capture) sit at the corners
+// of a 44 mm square (AEC_MIC_ARRAY_GEO: mic0 +x-y, mic1 +x+y, mic2 -x+y, mic3
+// -x-y). We cross-correlate opposite pairs for the inter-mic delay, atan2 that
+// into a per-window azimuth, and VOTE it into a fading histogram so the stable
+// (direct-path) bearings accumulate into peaks while reverberant reflections
+// scatter and fade — the peaks are the numbered sources (see scene_process).
+// COARSE by nature: at 16 kHz the max delay across 44 mm is ~2 samples, so
+// expect ~±20-30° and NO real distance. `str` is a bearing's accumulated
+// histogram weight — how persistent/loud, not a range. Azimuth ORIENTATION
+// needs a one-time calibration — talk from a known spot and note where it lands;
+// swap the pair args below to rotate/flip. No ASR here: this is the pre-ASR
+// acoustic map, meant to be tailed live. Measured: front ~0°, mic-left ~+85°,
+// mic-right ~-90° (positive = the array's left).
+#define SC_WIN   (BLOCK * 3)                  // 30 ms DoA window
+#define SC_LAG   3                            // max |lag| in samples (44 mm ~ 2.05 @16k)
+#define SC_NTR   8
+#define SC_GATE  25.0                         // deg: fold a histogram peak into a nearby track
+#define SC_REP   15                           // windows (~0.45 s) between reports
+#define SC_BINS  36                           // 10° azimuth bins for the temporal histogram
+#define SC_HMIN  0.8                          // floor: min conf^2 for a bin to be a source (quiet room)
+#define SC_HRAT  4.0                          // and it must stand this many x above the diffuse median
+#define SC_ONSET 3.0                          // dB above the recent trend = an attack (direct path)
+#define SC_DECAY 0.98                         // per-window bin decay (~1.5 s fading memory): the
+                                              // direct path recurs and accumulates, echoes scatter
+
+struct sctrack { int id; double az, lvl; long last, rep; };
+
+// Bandpass a mic window to ~300-3500 Hz (below the 44 mm spatial-aliasing limit
+// ~3.9 kHz, above room rumble): one-pole LP then HP. Broadband transients like
+// finger clicks alias above that and gave a garbage fixed azimuth; band-limiting
+// to the coherent speech band fixes it and de-weights out-of-band noise.
+static void sc_bp(const int16_t *in, double *out, int n) {
+    double lp = 0, y = 0, xp = 0;
+    for (int i = 0; i < n; i++) {
+        lp += 0.75 * ((double)in[i] - lp);       // LP ~3.5 kHz (anti-alias)
+        y   = 0.89 * (y + lp - xp);              // HP ~300 Hz (block DC/rumble)
+        xp = lp; out[i] = y;
+    }
+}
+
+// parabolic-interpolated TDOA (samples) between bandpassed a and b, and the
+// normalized correlation peak as a confidence — high for a coherent directional
+// source, low for diffuse/ambiguous sound (reported as directionless instead).
+static double sc_tdoa(const double *a, const double *b, int n, double *conf) {
+    double r[2 * SC_LAG + 1], best = -1e18, ea = 0, eb = 0; int bl = 0;
+    for (int i = SC_LAG; i < n - SC_LAG; i++) { ea += a[i] * a[i]; eb += b[i] * b[i]; }
+    for (int l = -SC_LAG; l <= SC_LAG; l++) {
+        double s = 0;
+        for (int i = SC_LAG; i < n - SC_LAG; i++) s += a[i] * b[i - l];
+        r[l + SC_LAG] = s;
+        if (s > best) { best = s; bl = l; }
+    }
+    *conf = (ea > 0 && eb > 0) ? best / sqrt(ea * eb) : 0;
+    if (bl > -SC_LAG && bl < SC_LAG) {         // sub-sample vertex (concave peak)
+        double rm = r[bl - 1 + SC_LAG], r0 = r[bl + SC_LAG], rp = r[bl + 1 + SC_LAG];
+        double den = rm - 2 * r0 + rp;
+        if (den < -1e-6) return bl + 0.5 * (rm - rp) / den;
+    }
+    return (double)bl;
+}
+
+static double sc_adist(double a, double b) { double d = fabs(a - b); return d > 180 ? 360 - d : d; }
+
+// wall-clock HH:MM:SS.mmm so a tailed scene log can be matched to what was
+// happening in the room at that instant (spoke here, chair moved there, ...).
+static const char *sc_ts(void) {
+    static char b[16];
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm; localtime_r(&ts.tv_sec, &tm);
+    snprintf(b, sizeof b, "%02d:%02d:%02d.%03ld", tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
+    return b;
+}
+
+// One 10 ms block of interleaved capture -> accumulate a DoA window, and on a
+// full window: level -> activity -> per-window bearing -> VOTE into a fading
+// azimuth histogram. The direct path lands in the same bin window after window
+// and accumulates; reverberant reflections arrive from scattered directions and
+// never build a peak. Every ~0.45 s we read the histogram's peaks as the stable
+// sources (match/spawn/age numbered tracks) and log them. This is the temporal
+// integration that collapses one real source's echo-spray to one bearing.
+// Called from the duplex thread; cheap (a few hundred MACs / 30 ms).
+static void scene_process(const int16_t *tick) {
+    static int16_t w[4][SC_WIN]; static int wn = 0;
+    static double H[SC_BINS]; static double flr = -60, senv = -60;
+    static long scwin = 0, rep = 0; static int recent = 0;
+    static struct sctrack tr[SC_NTR]; static int ntr = 0, nextid = 1;
+    int ch = g_channels;
+    for (int i = 0; i < BLOCK && wn < SC_WIN; i++, wn++)
+        for (int k = 0; k < 4; k++) w[k][wn] = tick[i * ch + 2 + k];
+    if (wn < SC_WIN) return;
+    wn = 0; scwin++;
+    double e = 0; for (int i = 0; i < SC_WIN; i++) e += (double)w[1][i] * w[1][i];
+    double lvl = 10.0 * log10(e / SC_WIN / (32768.0 * 32768.0) + 1e-12);
+    // adaptive floor: creep up slowly, fall toward a quieter level — tracks the
+    // room ambient without latching onto a single quiet frame's minimum
+    flr += (lvl > flr) ? 0.02 : (lvl - flr) * 0.2;
+    for (int b = 0; b < SC_BINS; b++) H[b] *= SC_DECAY;   // ~1.5 s fading memory of bearings
+    senv += (lvl - senv) * 0.05;                          // slow trend ~= the reverberant floor
+    if (lvl > flr + 15.0 && lvl > -58.0) {                // clear, above-ambient activity
+        recent = 1;
+        // Precedence: localize on the ATTACK — where the direct path leads the
+        // reflections — and ignore the sustain, where echoes have filled in and
+        // "loudest direction" lies. lvl above its own recent trend = a leading edge.
+        if (lvl - senv > SC_ONSET) {
+            static double bp[4][SC_WIN];
+            for (int k = 0; k < 4; k++) sc_bp(w[k], bp[k], SC_WIN);
+            double cx, cy;
+            double tx = sc_tdoa(bp[1], bp[2], SC_WIN, &cx);   // +x vs -x
+            double ty = sc_tdoa(bp[1], bp[0], SC_WIN, &cy);   // +y vs -y
+            double conf = cx < cy ? cx : cy;
+            if (conf > 0.0) {                             // vote weighted conf^2: clean attacks
+                double az = atan2(ty, tx) * 180.0 / M_PI; // concentrate on the direct-path bearing,
+                int b = (int)floor((az + 180.0) / (360.0 / SC_BINS));   // noisy ones scatter thin
+                b = b < 0 ? 0 : b >= SC_BINS ? SC_BINS - 1 : b;
+                H[b] += conf * conf;
+            }
+        }
+    }
+    if (scwin - rep < SC_REP) return;                     // read out every ~0.45 s
+    rep = scwin;
+    const char *ts = sc_ts();
+    // auto-calibrating bar: a real source stands well above the room's OWN diffuse
+    // background, so scale the threshold to the median bin instead of a fixed number
+    // (portable across dead vs reverberant rooms). The floor keeps a near-empty
+    // histogram (quiet room) from promoting noise into a source.
+    double tmp[SC_BINS]; memcpy(tmp, H, sizeof tmp);
+    for (int i = 1; i < SC_BINS; i++) { double v = tmp[i]; int j = i - 1;
+        while (j >= 0 && tmp[j] > v) { tmp[j + 1] = tmp[j]; j--; } tmp[j + 1] = v; }
+    double thr = SC_HRAT * tmp[SC_BINS / 2];              // SC_HRAT x the median (diffuse) bin
+    if (thr < SC_HMIN) thr = SC_HMIN;
+    int any = 0;                                          // did any bearing survive as a peak
+    for (int b = 0; b < SC_BINS; b++) {                   // local maxima above threshold = sources
+        double hl = H[(b - 1 + SC_BINS) % SC_BINS], hr = H[(b + 1) % SC_BINS];
+        if (H[b] < thr || H[b] < hl || H[b] < hr) continue;
+        double az = (b + 0.5) * (360.0 / SC_BINS) - 180.0;
+        int m = -1; double bd = SC_GATE;
+        for (int t = 0; t < ntr; t++) { double d = sc_adist(az, tr[t].az); if (d < bd) { bd = d; m = t; } }
+        if (m < 0) {
+            if (ntr < SC_NTR) {
+                m = ntr++;
+                tr[m] = (struct sctrack){ nextid++, az, H[b], scwin, scwin };
+                fprintf(stderr, "%s scene: src#%d NEW   az=%+4.0f  str=%.1f\n", ts, tr[m].id, az, H[b]);
+            }
+        } else {
+            tr[m].az = 0.6 * tr[m].az + 0.4 * az; tr[m].lvl = H[b]; tr[m].last = scwin;
+            fprintf(stderr, "%s scene: src#%d       az=%+4.0f  str=%.1f\n", ts, tr[m].id, tr[m].az, H[b]);
+        }
+        any = 1;
+    }
+    if (!any && recent) {                                 // sound, but no bearing held together —
+        int pb = 0;                                       // show the leading sub-threshold bin so we
+        for (int b = 1; b < SC_BINS; b++) if (H[b] > H[pb]) pb = b;   // can tell "near miss" from
+        fprintf(stderr, "%s scene: diffuse       (top az=%+4.0f str=%.1f, below %.1f)\n",   // "true smear"
+                ts, (pb + 0.5) * (360.0 / SC_BINS) - 180.0, H[pb], thr);
+    }
+    recent = 0;
+    for (int t = 0; t < ntr; ) {                          // a bearing gone quiet 2 reports -> GONE
+        if (scwin - tr[t].last >= 2 * SC_REP) {
+            fprintf(stderr, "%s scene: src#%d GONE  (was az=%+4.0f)\n", ts, tr[t].id, tr[t].az);
+            tr[t] = tr[--ntr];
+        } else t++;
+    }
+}
+
 static void *duplex_main(void *arg) {
     (void)arg;
     int err = 0;
@@ -222,6 +391,7 @@ static void *duplex_main(void *arg) {
                 clean[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
             }
         tap_cast(clean, raw);
+        if (g_scene) scene_process(tick);            // pre-ASR acoustic map (DoA + tracks)
     }
     return NULL;
 }
@@ -429,6 +599,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pre-gain-db") && i + 1 < argc)  g_pre_gain = pow(10.0, atof(argv[++i]) / 20.0);
         else if (!strcmp(argv[i], "--duck-db") && i + 1 < argc)      g_duck_gain = pow(10.0, -atof(argv[++i]) / 20.0);
         else if (!strcmp(argv[i], "--no-aec"))                       g_no_aec = 1;
+        else if (!strcmp(argv[i], "--scene"))                        g_scene = 1;
         else {
             fprintf(stderr, "far-field-service: unknown argument %s\n", argv[i]);
             return 1;
@@ -440,12 +611,13 @@ int main(int argc, char **argv) {
     if (!spath) {
         fprintf(stderr,
             "usage: far-field-service -s PATH [--source S] [--sink K] [--channels N]\n"
-            "                         [--use-channel K] [--gain-db D] [--no-aec]\n"
+            "                         [--use-channel K] [--gain-db D] [--no-aec] [--scene]\n"
             "       far-field-service --tap PATH [--raw]     clean (raw) mic -> stdout\n"
             "       far-field-service --speak PATH [--rate N=22050]  stdin PCM -> speaker\n");
         return 1;
     }
     if (g_use_ch >= g_channels) { fprintf(stderr, "far-field-service: --use-channel out of range\n"); return 1; }
+    if (g_scene && g_channels < 6) { fprintf(stderr, "far-field-service: --scene needs the 4 raw mics (run --channels 6)\n"); g_scene = 0; }
 
     if (!g_no_aec) {
         g_aec = aec_new(RATE);               // which impl = link time (aec.h seam);

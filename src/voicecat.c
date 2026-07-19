@@ -1487,7 +1487,7 @@ int main(int argc, char **argv) {
                         snprintf(line, sizeof line, "%s%s%s", !turn_open ? turn_clock() : "",
                                  !turn_open && barged ? g_barge_note : "", cur + a);
                 }
-                if (turn_open || barged) {               // >=1 word survived the two-pass agreement (turn_open) or a barge — a lone final-pass guess on noise (no agreement) is dropped, killing the ambient-noise 0-word reply storm
+                if (turn_open || line[0]) {              // silence/false trigger sends nothing
                     size_t L = strlen(line);
                     if (L > sizeof line - 2) L = sizeof line - 2;
                     line[L] = '\n'; line[L + 1] = 0;

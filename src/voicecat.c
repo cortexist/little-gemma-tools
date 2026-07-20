@@ -100,6 +100,18 @@ static int g_commit_ms = 2500, g_hang_ms = 700, g_vad = 400, g_realtime = 0;
 // it can only fire on non-speech, bounding the buffer and freeing the loop to
 // respond over a sustained sound. 0 = off.
 static int g_max_utt = 15;
+// --wordless-close N: the ASR's OWN no-speech verdict ends the utterance N
+// consecutive mid-passes early — each pass that returns zero words (its tags,
+// [Music] and kin, strip before counting) is whisper saying "nothing is being
+// said here", and whisper is the one component that judges CONTENT: both
+// spatial trackers fire on loud music (measured live — chip spe 14k-1.6M,
+// histogram str to 2.7), but 30 s of phone music yielded zero words. Two
+// verdicts in a row close the turn at ~2x --commit-ms instead of --max-utt's
+// 15 s: a question asked over music is answered while the music plays. Words
+// always win — any word in a pass resets the count, so fluent speech can
+// never trip it; a wordless close with committed words sends them, without
+// words it sends nothing (today's false-trigger path). 0 = off.
+static int g_wordless = 2;
 // --sound-tags: pass whisper's non-speech tags ([Music], (typing)) to the model.
 // OFF by default — E2B narrates every sound. On, for a model that can govern it.
 static int g_sound_tags = 0;
@@ -1269,6 +1281,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--commit-ms") && i + 1 < argc)     g_commit_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hang-ms") && i + 1 < argc)       g_hang_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-utt") && i + 1 < argc)       g_max_utt = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--wordless-close") && i + 1 < argc) g_wordless = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--sound-tags"))                    g_sound_tags = 1;
         else if (!strcmp(argv[i], "--vad-level") && i + 1 < argc)     g_vad = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--listener"))                      g_listener = 1;
@@ -1287,6 +1300,9 @@ int main(int argc, char **argv) {
             "                [--whisper-model FILE] [--whisper-bin PATH] [--whisper-url URL]\n"
             "                [--barge-note TEXT] [--mouth-synth CMD --mouth-play CMD]\n"
             "                [--commit-ms N=2500] [--hang-ms N=700] [--max-utt N=15] [--vad-level N=400] [--sound-tags]\n"
+            "                [--wordless-close N=2]  N consecutive whisper passes with zero words\n"
+            "               close the utterance (~N x commit-ms into music/noise, vs max-utt's\n"
+            "               15 s) — the ASR's own content verdict; any word resets it. 0 = off\n"
             "                [--listener [--probe-ms N=1500] [--probe-gen N=6] [--probe-suffix TEXT]]\n"
             "  --mic        ffmpeg input spec (default \"-f alsa -i default\" on Linux)\n"
             "  --stdin-pcm  mono 16 kHz s16 PCM on stdin instead of a mic\n"
@@ -1392,6 +1408,7 @@ int main(int argc, char **argv) {
     int in_utt = 0, onset = 0, sil_ms = 0, turn_open = 0, barged = 0, pause_probed = 0;
     int utt_talker = 0;                              // a live talker owned this utterance at
                                                      // some point (always 1 with the gate unarmed)
+    int wordless = 0;                                // consecutive mid-passes with zero words
     int duck_pending = 0;                            // a stage-1 duck awaiting words
     int pending = 0, barge_armed = 1, tstate = 0;    // replies awaited; one barge per utterance
     char rbuf[4096];
@@ -1481,6 +1498,7 @@ int main(int argc, char **argv) {
                     in_utt = 1; sil_ms = 0; onset = 0; pause_probed = 0;
                     committed = 0; trimmed = 0; ptail[0] = 0;
                     prev[0] = 0; last_pass = 0; last_voice = ub_n; turn_open = 0;
+                    wordless = 0;
                     utt_talker = talker_live();          // sticky below: the tracker's
                                                          // report may lag a first word
                 }
@@ -1568,6 +1586,9 @@ int main(int argc, char **argv) {
                             fprintf(stderr, "voicecat: window -%0.1fs (%d words confirmed away)\n",
                                     (double)trim / LG_RATE, twords);
                         }
+                        wordless = cur[0] ? 0 : wordless + 1;        // the ear's own verdict:
+                                                                     // tags strip before this,
+                                                                     // so music counts as silence
                     }
                 }
             }
@@ -1579,11 +1600,15 @@ int main(int argc, char **argv) {
         // as it confirms so its window never reaches the cap; this only fires
         // on non-speech, so it can't cut a real utterance mid-word.
         int max_utt_hit = g_max_utt > 0 && ub_n >= (size_t)g_max_utt * LG_RATE;
-        if (in_utt && (sil_ms >= g_hang_ms || eof || max_utt_hit)) {
+        int wordless_hit = g_wordless > 0 && wordless >= g_wordless;
+        if (in_utt && (sil_ms >= g_hang_ms || eof || max_utt_hit || wordless_hit)) {
             in_utt = 0;
             if (max_utt_hit)
                 fprintf(stderr, "voicecat: max-utt cap (%.0fs unconfirmed audio) — closing\n",
                         (double)ub_n / LG_RATE);
+            else if (wordless_hit)
+                fprintf(stderr, "voicecat: no words in %d passes (%.1fs of sound) — closing\n",
+                        wordless, (double)ub_n / LG_RATE);
             if (whisper) {
                 char line[8192] = "";
                 // The scene verdict outranks the ASR on whether anyone SPOKE:
@@ -1597,7 +1622,7 @@ int main(int argc, char **argv) {
                 // arrived after the last mid-pass began, that pass already
                 // heard every spoken word: reuse its transcript instead of
                 // paying a whole ASR invocation to re-transcribe silence.
-                int heard = last_pass > 0 && last_voice <= last_pass;
+                int heard = (last_pass > 0 && last_voice <= last_pass) || wordless_hit;
                 int ok = worth && (heard || whisper_pass(ub, ub_n, ptail, cur, sizeof cur, segs, &nseg) == 0);
                 if (!worth)
                     fprintf(stderr, "voicecat: no talker owned this sound (%.1fs) — dropped\n",

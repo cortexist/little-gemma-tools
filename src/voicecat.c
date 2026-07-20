@@ -29,14 +29,17 @@
 // faster than real time (tiny/base on a GPU) or commits fall behind capture.
 // v1 shells out to ffmpeg (capture) and whisper-cli over pipes, like mmcat.
 //
-// SCENE-GATED EARS (--stdin-mux): an energy VAD cannot tell "the talker
-// stopped" from "the room is loud" — music after a question held the turn
-// open until the music ended (or --max-utt fired, 15 s late). far-field's
-// --scene tracker CAN tell (a talker is a localized attack source; music is
-// diffuse — measured), and with --mux its verdict rides the same pipe as
-// the audio. Here that verdict gates the END of an utterance and whether a
-// sound is worth ASR at all; onset stays energy-only so a first word is
-// never lost to the tracker's report lag.
+// SCENE-GATED EARS (--stdin-mux + --scene-gate): an energy VAD cannot tell
+// "the talker stopped" from "the room is loud" — music after a question held
+// the turn open until the music ended (or --max-utt fired, 15 s late).
+// far-field's --scene tracker CAN tell (a talker is a localized attack
+// source; music is diffuse — measured), and with --mux its verdict rides
+// the same pipe as the audio. The gate makes that verdict decide the END
+// of an utterance and whether a sound is worth ASR at all; onset stays
+// energy-only so a first word is never lost to the tracker's report lag.
+// The gate is opt-in until the tracker's recall is proven at the room's
+// real positions (see the flag comment); --stdin-mux alone just parses
+// and logs the verdicts.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -105,8 +108,8 @@ static int g_sound_tags = 0;
 // rule: echo residuals and AEC startup transients must not cut the mouth.
 static int g_barge_mult = 2, g_barge_onset = 6;
 // --stdin-mux: stdin carries far-field-service's framed tap ('P' pcm with
-// 'S' scene verdicts riding along) instead of bare PCM. While 'S' frames
-// flow, `voiced` needs energy AND a live localized talker, so sustained
+// 'S' scene verdicts riding along) instead of bare PCM. With --scene-gate
+// on top, `voiced` needs energy AND a live localized talker, so sustained
 // music (diffuse to the tracker) reads as silence: the turn closes on
 // --hang-ms as if the room had gone quiet, and an utterance no talker ever
 // owned skips ASR and sends nothing — whisper never gets to hallucinate
@@ -115,14 +118,25 @@ static int g_barge_mult = 2, g_barge_onset = 6;
 // far-field, or a stalled one, 2 s): plain energy then rules, never deaf.
 // --talker-hold bridges the tracker's ~0.45 s report cadence plus the
 // beats inside a sentence; it only pads the close, never the capture.
-static int g_stdin_mux = 0, g_talker_hold = 900;
+//
+// --scene-gate is OPT-IN, and stays off until the tracker's recall is
+// proven AT THE ROOM'S REAL POSITIONS: measured 2026-07-19, conversational
+// speech from the desk never crossed the promotion floor (str 0.0-0.5 vs
+// 0.8, every utterance dropped = a deaf pipeline), while the same tracker
+// promoted a talker speaking near the array. A gate that decides what is
+// WORTH HEARING inherits the tracker's misses wholesale — so it must not
+// be default until a live tuning session sets the thresholds from both
+// desk-distance speech and music evidence. Without --scene-gate the mux
+// stream still parses and scene transitions still log: the instrument
+// runs, the policy waits.
+static int g_stdin_mux = 0, g_scene_gate = 0, g_talker_hold = 900;
 static int    g_sc_seen = 0;             // an 'S' frame has arrived: the gate is armed
 static double g_sc_last_rx = 0, g_sc_last_yes = 0;
 static double g_sc_az = 0;               // the talker's last reported bearing
 
 static double now_sec(void);
 static int talker_live(void) {
-    if (!g_sc_seen) return 1;
+    if (!g_scene_gate || !g_sc_seen) return 1;
     double now = now_sec();
     if (now - g_sc_last_rx > 2.0) return 1;          // scene stream stalled: fail open
     return now - g_sc_last_yes < (double)g_talker_hold / 1000.0;
@@ -316,10 +330,18 @@ static size_t mux_tick(FILE *src, int16_t *frame) {
             sc[take] = 0;
             g_sc_seen = 1;
             g_sc_last_rx = now_sec();
-            if (strstr(sc, "talker=1")) {
+            int talker = strstr(sc, "talker=1") != NULL;
+            if (talker) {
                 g_sc_last_yes = g_sc_last_rx;
                 const char *a = strstr(sc, "az=");
                 if (a) g_sc_az = atof(a + 3);
+            }
+            static int last_talker = -1;             // transitions only: the live
+            if (talker != last_talker) {             // instrument for tuning the
+                last_talker = talker;                // tracker against this room
+                if (talker) fprintf(stderr, "voicecat: scene talker az=%+.0f%s\n",
+                                    g_sc_az, g_scene_gate ? "" : " (gate off)");
+                else        fprintf(stderr, "voicecat: scene talker gone\n");
             }
             continue;
         }
@@ -1231,6 +1253,7 @@ int main(int argc, char **argv) {
         if      (!strcmp(argv[i], "--mic") && i + 1 < argc)           mic = argv[++i];
         else if (!strcmp(argv[i], "--stdin-pcm"))                     stdin_pcm = 1;
         else if (!strcmp(argv[i], "--stdin-mux"))                     stdin_pcm = g_stdin_mux = 1;
+        else if (!strcmp(argv[i], "--scene-gate"))                    g_scene_gate = 1;
         else if (!strcmp(argv[i], "--talker-hold") && i + 1 < argc)   g_talker_hold = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--realtime"))                      g_realtime = 1;
         else if (!strcmp(argv[i], "--whisper-model") && i + 1 < argc) g_whisper_model = argv[++i];
@@ -1268,10 +1291,13 @@ int main(int argc, char **argv) {
             "  --mic        ffmpeg input spec (default \"-f alsa -i default\" on Linux)\n"
             "  --stdin-pcm  mono 16 kHz s16 PCM on stdin instead of a mic\n"
             "  --stdin-mux  far-field-service --tap --mux frames on stdin: pcm plus the\n"
-            "               scene tracker's talker verdicts. While those flow, an utterance\n"
-            "               ENDS when the talker stops even if music plays on, and a sound\n"
-            "               no talker owned is dropped without ASR (--talker-hold N=900 ms\n"
-            "               bridges report cadence and speech beats; no frames = plain energy)\n"
+            "               scene tracker's talker verdicts (parsed and logged always)\n"
+            "  --scene-gate act on those verdicts: an utterance ENDS when the talker stops\n"
+            "               even if music plays on, and a sound no talker owned is dropped\n"
+            "               without ASR (--talker-hold N=900 ms bridges report cadence and\n"
+            "               speech beats; no 'S' frames = plain energy). OPT-IN: the gate\n"
+            "               inherits the tracker's misses — prove its recall in the room\n"
+            "               (watch 'scene talker' lines) before turning it on\n"
             "  --whisper-url  POST passes to a resident whisper-server /inference instead\n"
             "               of spawning whisper-cli — no model load per pass; with fast\n"
             "               passes --commit-ms can drop to ~3x the measured pass cost\n"

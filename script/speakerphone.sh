@@ -84,9 +84,12 @@ fi
 echo "speakerphone: talk when ready (ctrl-c to stop)" >&2
 # Ears: far-field-service's clean tap (AEC3'd, gain-lifted) pipes straight
 # into --stdin-mux: pcm plus the --scene tracker's talker verdicts riding
-# one pipe, so an utterance ends when the TALKER stops — music playing on
-# cannot hold the turn open, and sound no talker owned is dropped without
-# ever reaching whisper or the model. Mouth: voicecat owns piper (warm, mux-framed, exact barge
+# one pipe. NOTE the gate on those verdicts (--scene-gate: turn ends when
+# the TALKER stops, talker-less sound dropped unheard) is NOT enabled yet:
+# live 2026-07-19, desk-distance speech never crossed the tracker's
+# promotion floor (str 0.0-0.5 vs 0.8) and the gate dropped every real
+# utterance. Verdicts are parsed and logged ('scene talker' lines) — tune
+# the tracker against this room first, then add --scene-gate. Mouth: voicecat owns piper (warm, mux-framed, exact barge
 # discard) and its player is the --speak client — a barge KILLS it, the
 # service flushes on the hangup, sound stops now; a clean close drains
 # politely. --hush-tail is ON: with real cancellation, speech over the

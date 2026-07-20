@@ -28,6 +28,15 @@
 // upstream); an open-air mic will barge on its own TTS. Whisper must run
 // faster than real time (tiny/base on a GPU) or commits fall behind capture.
 // v1 shells out to ffmpeg (capture) and whisper-cli over pipes, like mmcat.
+//
+// SCENE-GATED EARS (--stdin-mux): an energy VAD cannot tell "the talker
+// stopped" from "the room is loud" — music after a question held the turn
+// open until the music ended (or --max-utt fired, 15 s late). far-field's
+// --scene tracker CAN tell (a talker is a localized attack source; music is
+// diffuse — measured), and with --mux its verdict rides the same pipe as
+// the audio. Here that verdict gates the END of an utterance and whether a
+// sound is worth ASR at all; onset stays energy-only so a first word is
+// never lost to the tracker's report lag.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +104,29 @@ static int g_sound_tags = 0;
 // open an utterance is HIGHER and LONGER — the browser demo's BARGE_THRESH
 // rule: echo residuals and AEC startup transients must not cut the mouth.
 static int g_barge_mult = 2, g_barge_onset = 6;
+// --stdin-mux: stdin carries far-field-service's framed tap ('P' pcm with
+// 'S' scene verdicts riding along) instead of bare PCM. While 'S' frames
+// flow, `voiced` needs energy AND a live localized talker, so sustained
+// music (diffuse to the tracker) reads as silence: the turn closes on
+// --hang-ms as if the room had gone quiet, and an utterance no talker ever
+// owned skips ASR and sends nothing — whisper never gets to hallucinate
+// words out of lyrics, and a native span of pure music never reaches the
+// model. The gate DISARMS by itself when scene frames stop (a scene-less
+// far-field, or a stalled one, 2 s): plain energy then rules, never deaf.
+// --talker-hold bridges the tracker's ~0.45 s report cadence plus the
+// beats inside a sentence; it only pads the close, never the capture.
+static int g_stdin_mux = 0, g_talker_hold = 900;
+static int    g_sc_seen = 0;             // an 'S' frame has arrived: the gate is armed
+static double g_sc_last_rx = 0, g_sc_last_yes = 0;
+static double g_sc_az = 0;               // the talker's last reported bearing
+
+static double now_sec(void);
+static int talker_live(void) {
+    if (!g_sc_seen) return 1;
+    double now = now_sec();
+    if (now - g_sc_last_rx > 2.0) return 1;          // scene stream stalled: fail open
+    return now - g_sc_last_yes < (double)g_talker_hold / 1000.0;
+}
 // --duck-sock: TWO-STAGE barge via far-field-service's control channel.
 // Stage 1, at onset: the reply DUCKS (drops --duck-db, keeps playing) —
 // instant, and cheap to undo. Stage 2, when words MATERIALIZE (first
@@ -257,6 +289,56 @@ static FILE *run_pipe(const char *cmd) {
 #else
     return popen(cmd, "r");
 #endif
+}
+
+// ---- the framed stdin (--stdin-mux) ------------------------------------------
+// One blocking reader reassembles mic ticks from 'P' payload and applies 'S'
+// scene verdicts as they pass. Frame boundaries (10 ms blocks) never align
+// with FR_SAMP ticks and don't need to; a short read is the pipe closing —
+// return the partial tick, fread-style, and the eof path takes over.
+static size_t mux_tick(FILE *src, int16_t *frame) {
+    static uint8_t carry[(1 << 16) + 1024];
+    static size_t cn = 0;
+    while (cn < FR_SAMP * 2) {
+        uint8_t hdr[LG_FRAME_HDR];
+        if (fread(hdr, 1, sizeof hdr, src) != sizeof hdr) break;
+        uint32_t len;
+        memcpy(&len, hdr + 6, 4);
+        if (hdr[0] != LG_FRAME_MAGIC || len > (1 << 16)) {
+            fprintf(stderr, "voicecat: bad mux frame — stream desynced\n");
+            break;
+        }
+        if (hdr[1] == 'S') {
+            char sc[64];
+            size_t take = len < sizeof sc - 1 ? len : sizeof sc - 1;
+            if (fread(sc, 1, take, src) != take) break;
+            for (size_t r = take; r < len; r++) fgetc(src);
+            sc[take] = 0;
+            g_sc_seen = 1;
+            g_sc_last_rx = now_sec();
+            if (strstr(sc, "talker=1")) {
+                g_sc_last_yes = g_sc_last_rx;
+                const char *a = strstr(sc, "az=");
+                if (a) g_sc_az = atof(a + 3);
+            }
+            continue;
+        }
+        if (hdr[1] != 'P') {                             // not ours: drain and move on
+            for (uint32_t r = 0; r < len; r++) fgetc(src);
+            continue;
+        }
+        if (cn + len > sizeof carry) {
+            fprintf(stderr, "voicecat: mux carry overflow — stream desynced\n");
+            break;
+        }
+        if (fread(carry + cn, 1, len, src) != len) break;
+        cn += len;
+    }
+    size_t out = cn < FR_SAMP * 2 ? cn : FR_SAMP * 2;
+    memcpy(frame, carry, out);
+    memmove(carry, carry + out, cn - out);
+    cn -= out;
+    return out / 2;
 }
 
 // ---- whisper over a temp wav (mmcat's pattern), words only -------------------
@@ -1148,6 +1230,8 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--mic") && i + 1 < argc)           mic = argv[++i];
         else if (!strcmp(argv[i], "--stdin-pcm"))                     stdin_pcm = 1;
+        else if (!strcmp(argv[i], "--stdin-mux"))                     stdin_pcm = g_stdin_mux = 1;
+        else if (!strcmp(argv[i], "--talker-hold") && i + 1 < argc)   g_talker_hold = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--realtime"))                      g_realtime = 1;
         else if (!strcmp(argv[i], "--whisper-model") && i + 1 < argc) g_whisper_model = argv[++i];
         else if (!strcmp(argv[i], "--whisper-bin") && i + 1 < argc)   g_whisper_bin = argv[++i];
@@ -1176,13 +1260,18 @@ int main(int argc, char **argv) {
     }
     if (!spath) {
         fprintf(stderr,
-            "usage: voicecat <socket> [--mic FFMPEG_INPUT | --stdin-pcm [--realtime]]\n"
+            "usage: voicecat <socket> [--mic FFMPEG_INPUT | --stdin-pcm | --stdin-mux [--realtime]]\n"
             "                [--whisper-model FILE] [--whisper-bin PATH] [--whisper-url URL]\n"
             "                [--barge-note TEXT] [--mouth-synth CMD --mouth-play CMD]\n"
             "                [--commit-ms N=2500] [--hang-ms N=700] [--max-utt N=15] [--vad-level N=400] [--sound-tags]\n"
             "                [--listener [--probe-ms N=1500] [--probe-gen N=6] [--probe-suffix TEXT]]\n"
             "  --mic        ffmpeg input spec (default \"-f alsa -i default\" on Linux)\n"
             "  --stdin-pcm  mono 16 kHz s16 PCM on stdin instead of a mic\n"
+            "  --stdin-mux  far-field-service --tap --mux frames on stdin: pcm plus the\n"
+            "               scene tracker's talker verdicts. While those flow, an utterance\n"
+            "               ENDS when the talker stops even if music plays on, and a sound\n"
+            "               no talker owned is dropped without ASR (--talker-hold N=900 ms\n"
+            "               bridges report cadence and speech beats; no frames = plain energy)\n"
             "  --whisper-url  POST passes to a resident whisper-server /inference instead\n"
             "               of spawning whisper-cli — no model load per pass; with fast\n"
             "               passes --commit-ms can drop to ~3x the measured pass cost\n"
@@ -1275,6 +1364,8 @@ int main(int argc, char **argv) {
     size_t last_pass = 0;                            // ub_n at the previous whisper pass
     size_t last_voice = 0;                           // ub_n at the last voiced frame
     int in_utt = 0, onset = 0, sil_ms = 0, turn_open = 0, barged = 0, pause_probed = 0;
+    int utt_talker = 0;                              // a live talker owned this utterance at
+                                                     // some point (always 1 with the gate unarmed)
     int duck_pending = 0;                            // a stage-1 duck awaiting words
     int pending = 0, barge_armed = 1, tstate = 0;    // replies awaited; one barge per utterance
     char rbuf[4096];
@@ -1285,7 +1376,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "voicecat: %s, listening\n", whisper ? "streaming transcripts" : "native audio spans");
     for (;;) {
-        size_t got = fread(frame, 2, FR_SAMP, src);
+        size_t got = g_stdin_mux ? mux_tick(src, frame) : fread(frame, 2, FR_SAMP, src);
         int eof = got < FR_SAMP;
         if (g_realtime && !eof) {
             // pace to the frame's DEADLINE, not a flat sleep: a live mic keeps
@@ -1330,7 +1421,9 @@ int main(int argc, char **argv) {
             long long ss = 0;
             for (int i = 0; i < FR_SAMP; i++) ss += (long long)frame[i] * frame[i];
             int rms = (int)sqrt((double)ss / FR_SAMP);
-            int voiced = rms >= g_vad;
+            int voiced = rms >= g_vad && talker_live();  // with the gate armed, loud-but-
+                                                         // diffuse (music) is not a voice:
+                                                         // sil_ms accumulates right through it
 
             if (!in_utt) {
                 memmove(ring, ring + FR_SAMP, sizeof ring - sizeof frame);   // roll the preroll
@@ -1362,12 +1455,17 @@ int main(int argc, char **argv) {
                     in_utt = 1; sil_ms = 0; onset = 0; pause_probed = 0;
                     committed = 0; trimmed = 0; ptail[0] = 0;
                     prev[0] = 0; last_pass = 0; last_voice = ub_n; turn_open = 0;
+                    utt_talker = talker_live();          // sticky below: the tracker's
+                                                         // report may lag a first word
                 }
             } else {
                 if (ub_n + FR_SAMP > ub_cap) { ub_cap *= 2; ub = realloc(ub, ub_cap * 2); }
                 memcpy(ub + ub_n, frame, sizeof frame); ub_n += FR_SAMP;
                 sil_ms = voiced ? 0 : sil_ms + FR_MS;
                 if (voiced) { last_voice = ub_n; pause_probed = 0; }
+                if (talker_live()) utt_talker = 1;       // energy-independent: a clipped
+                                                         // word's report can land in the
+                                                         // hang window and still count
                 // a beat in the speech — the classic spot for a listener cue:
                 // probe once per pause, on the committed context, rate-limited
                 if (g_listener && turn_open && !voiced && sil_ms >= PROBE_PAUSE_MS && !pause_probed &&
@@ -1383,7 +1481,7 @@ int main(int argc, char **argv) {
                 // probably ending, and with a per-invocation ASR (whisper-cli
                 // reloads its model every pass) a late mid-pass only delays
                 // the final one that supersedes it.
-                if (whisper && sil_ms < 300 && ub_n - last_pass >= (size_t)g_commit_ms * (LG_RATE / 1000)) {
+                if (whisper && utt_talker && sil_ms < 300 && ub_n - last_pass >= (size_t)g_commit_ms * (LG_RATE / 1000)) {
                     last_pass = ub_n;
                     if (whisper_pass(ub, ub_n, ptail, cur, sizeof cur, segs, &nseg) == 0) {
                         int agree = agree_words(prev, cur);
@@ -1462,13 +1560,22 @@ int main(int argc, char **argv) {
                         (double)ub_n / LG_RATE);
             if (whisper) {
                 char line[8192] = "";
+                // The scene verdict outranks the ASR on whether anyone SPOKE:
+                // an utterance no talker ever owned (music, a slammed door)
+                // gets no final pass and sends nothing — whisper never gets
+                // the chance to hallucinate words out of lyrics and hand the
+                // model a turn nobody took.
+                int worth = utt_talker || turn_open;
                 // The final pass runs over the TRIMMED window — the unconfirmed
                 // tail, not the whole utterance. And when no voiced frame
                 // arrived after the last mid-pass began, that pass already
                 // heard every spoken word: reuse its transcript instead of
                 // paying a whole ASR invocation to re-transcribe silence.
                 int heard = last_pass > 0 && last_voice <= last_pass;
-                int ok = heard || whisper_pass(ub, ub_n, ptail, cur, sizeof cur, segs, &nseg) == 0;
+                int ok = worth && (heard || whisper_pass(ub, ub_n, ptail, cur, sizeof cur, segs, &nseg) == 0);
+                if (!worth)
+                    fprintf(stderr, "voicecat: no talker owned this sound (%.1fs) — dropped\n",
+                            (double)ub_n / LG_RATE);
                 if (ok) {
                     size_t a = after_word(cur, committed - trimmed);
                     while (cur[a] == ' ') a++;
@@ -1500,9 +1607,11 @@ int main(int argc, char **argv) {
                     barged = 0; barge_armed = 1;         // false alarm just stays quiet. Either
                     fprintf(stderr, "voicecat: barge came to nothing\n");   // way the next real
                 }                                        // turn is NOT an interruption
-            } else if (ub_n >= LG_RATE / 2) {            // native span; drop sub-0.5s blips
-                if (duck_pending) {                      // a real half-second of audio IS
-                    if (pending > 0 && barge_armed) {    // materialization on this path
+            } else if (ub_n >= LG_RATE / 2 && utt_talker) {   // native span; drop sub-0.5s
+                                                         // blips and talker-less sound —
+                                                         // pure music never reaches the model
+                if (duck_pending) {                      // a real half-second of OWNED audio
+                    if (pending > 0 && barge_armed) {    // IS materialization on this path
                         uint8_t bb = LG_BARGE;
                         send_all(s, &bb, 1);
                         barge_armed = 0;
@@ -1522,11 +1631,16 @@ int main(int argc, char **argv) {
                 send_all(s, "\n", 1);
                 pending++; barge_armed = 1; dirty = 1; g_last_close = now_sec();
                 fprintf(stderr, "voicecat: turn closed (%.1fs audio)\n", (double)ub_n / LG_RATE);
-            } else if (barged || duck_pending) {         // a sub-0.5s barge blip: same false alarm
-                if (duck_pending) duck_set(0);
-                duck_pending = 0;
-                barged = 0; barge_armed = 1;
-                fprintf(stderr, "voicecat: barge came to nothing\n");
+            } else {                                     // a blip, or talker-less sound:
+                if (ub_n >= LG_RATE / 2)                 // the same false alarm either way
+                    fprintf(stderr, "voicecat: no talker owned this sound (%.1fs) — dropped\n",
+                            (double)ub_n / LG_RATE);
+                if (barged || duck_pending) {            // ...and a barge over it un-ducks:
+                    if (duck_pending) duck_set(0);       // the reply swells back — music
+                    duck_pending = 0;                    // cannot cut the mouth
+                    barged = 0; barge_armed = 1;
+                    fprintf(stderr, "voicecat: barge came to nothing\n");
+                }
             }
         }
 

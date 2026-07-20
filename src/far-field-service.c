@@ -15,11 +15,14 @@
 //
 // The wire is the house frame ({magic, type, u16 w, u16 h, u32 len} +
 // payload, lg_media_proto.h). A client's FIRST frame declares it:
-//   'e' ears  (w=1: the raw pre-cancel channel instead of the clean one)
+//   'e' ears  (w bit 0: the raw pre-cancel channel instead of the clean
+//             one; w bit 1: also want 'S' scene frames — meta rides the
+//             data stream, one wire, no side channel)
 //   'm' mouth (payload "rate=NNNNN\n"; one mouth at a time)
 // then a mouth streams 'P' pcm (s16 mono at its declared rate — resampled
 // here once, played, and fed to the canceller as reference) and may send
-// 'F' to flush; taps just read 'P' frames of 16 kHz s16 mono. A mouth
+// 'F' to flush; taps just read 'P' frames of 16 kHz s16 mono (scene taps
+// get 'S' text lines interleaved at the tracker's report cadence). A mouth
 // hanging up FLUSHES what it queued — killing the speak client IS the
 // barge cut, which is exactly how voicecat's --mouth-play uses it.
 //
@@ -62,6 +65,11 @@
                                          // hangup WITHOUT it is a cut (the barge)
 #define FF_DUCK  'd'                     // stage-1 barge: playback drops --duck-db,
 #define FF_REST  'u'                     // keeps playing; 'u' (or ctrl hangup) restores
+#define FF_SCENE 'S'                     // to scene taps: "talker=1 az=+3\n" / "talker=0\n"
+                                         // — the tracker's verdict, so a turn-taker can
+                                         // judge end of speech by THE TALKER stopping, not
+                                         // the room going quiet (music must not hold a
+                                         // VAD open; the gate itself lives client-side)
 
 static const char *g_source = NULL, *g_sink = NULL;
 static int    g_channels = 1, g_use_ch = 0, g_no_aec = 0, g_scene = 0;
@@ -77,13 +85,18 @@ static struct aec *g_aec = NULL;
 
 // ---- taps ---------------------------------------------------------------------
 static pthread_mutex_t t_mx = PTHREAD_MUTEX_INITIALIZER;
-static struct { int fd; int raw; } g_tap[MAXTAP];
+static struct { int fd; int raw; int scene; } g_tap[MAXTAP];
 static int g_ntap = 0;
 
-static void tap_add(int fd, int raw) {
+static void tap_add(int fd, int raw, int scene) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
     pthread_mutex_lock(&t_mx);
-    if (g_ntap < MAXTAP) { g_tap[g_ntap].fd = fd; g_tap[g_ntap].raw = raw; g_ntap++; }
+    if (g_ntap < MAXTAP) {
+        g_tap[g_ntap].fd = fd;
+        g_tap[g_ntap].raw = raw;
+        g_tap[g_ntap].scene = scene;
+        g_ntap++;
+    }
     else close(fd);
     pthread_mutex_unlock(&t_mx);
 }
@@ -105,6 +118,36 @@ static void tap_cast(const int16_t *clean, const int16_t *raw) {
         if (k != (ssize_t)sizeof msg) {      // dead, or a short write that would desync its stream
             fprintf(stderr, "far-field-service: tap %d dropped (%s)\n",
                     g_tap[i].fd, k < 0 ? strerror(errno) : "short write");
+            close(g_tap[i].fd);
+            g_tap[i] = g_tap[--g_ntap];
+            continue;
+        }
+        i++;
+    }
+    pthread_mutex_unlock(&t_mx);
+}
+
+// The tracker's verdict to every scene tap, at report cadence (~0.45 s).
+// tap_cast's discipline: a full pipe drops the report (the next is half a
+// second away), a short write or a dead tap is reaped in place.
+static void scene_cast(int present, double az) {
+    char txt[48];
+    int n = present ? snprintf(txt, sizeof txt, "talker=1 az=%+.0f\n", az)
+                    : snprintf(txt, sizeof txt, "talker=0\n");
+    uint8_t msg[LG_FRAME_HDR + sizeof txt];
+    memset(msg, 0, LG_FRAME_HDR);
+    msg[0] = LG_FRAME_MAGIC;
+    msg[1] = FF_SCENE;
+    uint32_t len = (uint32_t)n;
+    memcpy(msg + 6, &len, 4);
+    memcpy(msg + LG_FRAME_HDR, txt, (size_t)n);
+    pthread_mutex_lock(&t_mx);
+    for (int i = 0; i < g_ntap; ) {
+        if (!g_tap[i].scene) { i++; continue; }
+        ssize_t k = send(g_tap[i].fd, msg, LG_FRAME_HDR + (size_t)n, MSG_NOSIGNAL);
+        if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { i++; continue; }
+        if (k != (ssize_t)(LG_FRAME_HDR + (size_t)n)) {
+            fprintf(stderr, "far-field-service: scene tap %d dropped\n", g_tap[i].fd);
             close(g_tap[i].fd);
             g_tap[i] = g_tap[--g_ntap];
             continue;
@@ -301,6 +344,14 @@ static void scene_process(const int16_t *tick) {
         fprintf(stderr, "%s scene: diffuse       (top az=%+4.0f str=%.1f, below %.1f)\n",   // "true smear"
                 ts, (pb + 0.5) * (360.0 / SC_BINS) - 180.0, H[pb], thr);
     }
+    // the verdict that rides the tap: a talker is a track that voted at THIS
+    // readout (matching happens only here, so last == scwin is exactly that);
+    // music/reverb never builds a peak and reports talker=0 — diffuse
+    int present = 0;
+    double paz = 0, pl = -1;
+    for (int t = 0; t < ntr; t++)
+        if (tr[t].last == scwin && tr[t].lvl > pl) { present = 1; paz = tr[t].az; pl = tr[t].lvl; }
+    scene_cast(present, paz);
     recent = 0;
     for (int t = 0; t < ntr; ) {                          // a bearing gone quiet 2 reports -> GONE
         if (scwin - tr[t].last >= 2 * SC_REP) {
@@ -435,7 +486,7 @@ static void *client_main(void *arg) {
 
     if (hdr[1] == FF_EARS) {
         if (len) { close(fd); return NULL; }
-        tap_add(fd, w == 1);
+        tap_add(fd, w & 1, (w >> 1) & 1);
         return NULL;                                 // capture thread owns it now
     }
     if (hdr[1] == FF_CTRL) {                         // duck/restore frames until hangup;
@@ -529,10 +580,10 @@ static int send_hdr(int s, uint8_t type, uint16_t w, uint32_t len) {
     return write(s, hdr, sizeof hdr) == (ssize_t)sizeof hdr ? 0 : -1;
 }
 
-static int run_tap(const char *path, int raw) {
+static int run_tap(const char *path, int raw, int mux) {
     int s = sock_connect(path);
     if (s < 0) { fprintf(stderr, "far-field-service: connect to %s failed\n", path); return 1; }
-    if (send_hdr(s, FF_EARS, raw ? 1 : 0, 0) != 0) return 1;
+    if (send_hdr(s, FF_EARS, (uint16_t)((raw ? 1 : 0) | (mux ? 2 : 0)), 0) != 0) return 1;
     setvbuf(stdout, NULL, _IONBF, 0);        // a mic stream must not sit in stdio
     uint8_t hdr[LG_FRAME_HDR];
     static uint8_t buf[1 << 16];
@@ -542,7 +593,14 @@ static int run_tap(const char *path, int raw) {
         memcpy(&len, hdr + 6, 4);
         if (hdr[0] != LG_FRAME_MAGIC || len > sizeof buf) { fprintf(stderr, "far-field-service: tap: bad frame\n"); break; }
         if (read_full(s, buf, len) != 0) { fprintf(stderr, "far-field-service: tap: truncated frame\n"); break; }
-        if (hdr[1] == FF_PCM && fwrite(buf, 1, len, stdout) != len) { fprintf(stderr, "far-field-service: tap: stdout closed\n"); break; }
+        if (mux) {                           // frames stay frames: pcm AND scene ride one pipe
+            if ((hdr[1] == FF_PCM || hdr[1] == FF_SCENE) &&
+                (fwrite(hdr, 1, LG_FRAME_HDR, stdout) != LG_FRAME_HDR ||
+                 fwrite(buf, 1, len, stdout) != len)) {
+                fprintf(stderr, "far-field-service: tap: stdout closed\n");
+                break;
+            }
+        } else if (hdr[1] == FF_PCM && fwrite(buf, 1, len, stdout) != len) { fprintf(stderr, "far-field-service: tap: stdout closed\n"); break; }
     }
     return 0;
 }
@@ -584,12 +642,13 @@ static int run_speak(const char *path, int rate) {
 // ---- main -------------------------------------------------------------------------
 int main(int argc, char **argv) {
     const char *spath = NULL, *tap = NULL, *speak = NULL;
-    int raw = 0, rate = 22050;
+    int raw = 0, mux = 0, rate = 22050;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-s") && i + 1 < argc)             spath = argv[++i];
         else if (!strcmp(argv[i], "--tap") && i + 1 < argc)          tap = argv[++i];
         else if (!strcmp(argv[i], "--speak") && i + 1 < argc)        speak = argv[++i];
         else if (!strcmp(argv[i], "--raw"))                          raw = 1;
+        else if (!strcmp(argv[i], "--mux"))                          mux = 1;
         else if (!strcmp(argv[i], "--rate") && i + 1 < argc)         rate = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--source") && i + 1 < argc)       g_source = argv[++i];
         else if (!strcmp(argv[i], "--sink") && i + 1 < argc)         g_sink = argv[++i];
@@ -606,13 +665,15 @@ int main(int argc, char **argv) {
         }
     }
     signal(SIGPIPE, SIG_IGN);
-    if (tap)   return run_tap(tap, raw);
+    if (tap)   return run_tap(tap, raw, mux);
     if (speak) return run_speak(speak, rate);
     if (!spath) {
         fprintf(stderr,
             "usage: far-field-service -s PATH [--source S] [--sink K] [--channels N]\n"
             "                         [--use-channel K] [--gain-db D] [--no-aec] [--scene]\n"
-            "       far-field-service --tap PATH [--raw]     clean (raw) mic -> stdout\n"
+            "       far-field-service --tap PATH [--raw] [--mux]  clean (raw) mic -> stdout\n"
+            "                         (--mux: house frames out — 'P' pcm + 'S' scene verdicts\n"
+            "                          for voicecat --stdin-mux, instead of bare PCM)\n"
             "       far-field-service --speak PATH [--rate N=22050]  stdin PCM -> speaker\n");
         return 1;
     }

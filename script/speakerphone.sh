@@ -83,7 +83,10 @@ fi
 
 echo "speakerphone: talk when ready (ctrl-c to stop)" >&2
 # Ears: far-field-service's clean tap (AEC3'd, gain-lifted) pipes straight
-# into --stdin-pcm. Mouth: voicecat owns piper (warm, mux-framed, exact barge
+# into --stdin-mux: pcm plus the --scene tracker's talker verdicts riding
+# one pipe, so an utterance ends when the TALKER stops — music playing on
+# cannot hold the turn open, and sound no talker owned is dropped without
+# ever reaching whisper or the model. Mouth: voicecat owns piper (warm, mux-framed, exact barge
 # discard) and its player is the --speak client — a barge KILLS it, the
 # service flushes on the hangup, sound stops now; a clean close drains
 # politely. --hush-tail is ON: with real cancellation, speech over the
@@ -98,8 +101,8 @@ echo "speakerphone: talk when ready (ctrl-c to stop)" >&2
 # --duck-sock: two-stage barge — speech over the reply first DUCKS it (it
 # keeps talking, 12 dB down); the hard cut waits for words to materialize,
 # and a door slam or cough swells the reply back instead of killing it.
-"$tools/far-field-service" --tap "$ffsock" \
-  | "$vc" "$sock" --stdin-pcm \
+"$tools/far-field-service" --tap "$ffsock" --mux \
+  | "$vc" "$sock" --stdin-mux \
       --vad-level 200 --hang-ms 500 --clock 0 --hush-tail \
       --barge-mult 8 --barge-onset 15 --duck-sock "$ffsock" \
       --whisper-url "$wurl" --commit-ms 1100 \

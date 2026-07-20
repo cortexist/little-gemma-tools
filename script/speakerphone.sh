@@ -106,7 +106,7 @@ echo "speakerphone: talk when ready (ctrl-c to stop)" >&2
 # and a door slam or cough swells the reply back instead of killing it.
 "$tools/far-field-service" --tap "$ffsock" --mux \
   | "$vc" "$sock" --stdin-mux \
-      --vad-level 200 --hang-ms 500 --clock 0 --hush-tail \
+      --vad-level 200 --hang-ms 500 --clock 0 --sound-tags --hush-tail \
       --barge-mult 8 --barge-onset 15 --duck-sock "$ffsock" \
       --whisper-url "$wurl" --commit-ms 1100 \
       --mouth-synth "$piper -m $LG_VOICE --output-mux --stream" \

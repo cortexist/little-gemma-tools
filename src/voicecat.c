@@ -112,9 +112,27 @@ static int g_max_utt = 15;
 // never trip it; a wordless close with committed words sends them, without
 // words it sends nothing (today's false-trigger path). 0 = off.
 static int g_wordless = 2;
-// --sound-tags: pass whisper's non-speech tags ([Music], (typing)) to the model.
-// OFF by default — E2B narrates every sound. On, for a model that can govern it.
+// --sound-tags: the ear's non-speech captions ([Music], (typing)) ride each
+// turn's closing line ONCE — raw and deduped. Whisper's tag vocabulary is
+// undocumented free text, so voice-sys teaches the FORM (bracketed spans =
+// ambient sound, not speech) and we pay no translation tokens. Tags NEVER
+// enter the word stream either way: agreement, streamed commits and
+// --wordless-close all judge content with tags stripped, so music still
+// closes a turn instead of holding it — and a tag-only turn is never sent,
+// the model simply learns what the ear heard alongside the next real words.
 static int g_sound_tags = 0;
+static char g_utt_tags[160];             // this utterance's distinct tags, " [Music]"-joined
+
+static void tag_note(const char *t, size_t n) {
+    size_t have = strlen(g_utt_tags);
+    char tag[96];
+    if (!g_sound_tags || n == 0 || n >= sizeof tag || have + n + 2 > sizeof g_utt_tags) return;
+    memcpy(tag, t, n);
+    tag[n] = 0;
+    if (strstr(g_utt_tags, tag)) return;             // one mention per utterance
+    g_utt_tags[have] = ' ';
+    memcpy(g_utt_tags + have + 1, tag, n + 1);
+}
 // While a reply is live (pending, or the mouth still sounding) the bar to
 // open an utterance is HIGHER and LONGER — the browser demo's BARGE_THRESH
 // rule: echo residuals and AEC startup transients must not cut the mouth.
@@ -419,20 +437,23 @@ static size_t parse_ts(const char *p) {                  // "hh:mm:ss.mmm" -> sa
     return (size_t)(((h * 60 + m) * 60 + sec) * LG_RATE);
 }
 
-// Append one transcript line/segment to `out`: by DEFAULT whisper's non-speech
-// tags ([Music], (typing), [BLANK_AUDIO]) are STRIPPED. Passing them to the model
-// made a small model (E2B) narrate every ambient sound — it won't obey "note it
-// but stay silent". `--sound-tags` keeps them, for a model/cognition layer that
-// CAN govern its reactions. Timestamp headers are stripped upstream (both parse
-// paths). Whitespace folded, a trailing space closes the last word. `w` = bytes,
-// `words` = completed words — both cumulative across calls.
+// Append one transcript line/segment to `out`: whisper's non-speech tags
+// ([Music], (typing), [BLANK_AUDIO]) ALWAYS strip from the word stream — the
+// agreement machinery, the streamed commits and the wordless count must judge
+// content, not captions. With --sound-tags a closed tag is noted aside
+// (tag_note) to ride the turn's closing line once. Timestamp headers are
+// stripped upstream (both parse paths). Whitespace folded, a trailing space
+// closes the last word. `w` = bytes, `words` = completed words — both
+// cumulative across calls.
 static void words_add(const char *text, char *out, size_t *w, size_t cap, int *words) {
     for (size_t i = 0; text[i]; ) {
         char c = text[i];
-        if (!g_sound_tags && (c == '[' || c == '(')) {   // drop a non-speech tag whole
+        if (c == '[' || c == '(') {                  // a caption, never speech
             char close = c == '[' ? ']' : ')';
-            while (text[i] && text[i] != close) i++;
-            if (text[i]) i++;
+            size_t j = i;
+            while (text[j] && text[j] != close) j++;
+            if (text[j]) { j++; tag_note(text + i, j - i); }
+            i = j;
             continue;
         }
         char cc = (c == '\r' || c == '\t' || c == '\n') ? ' ' : c;
@@ -1299,10 +1320,13 @@ int main(int argc, char **argv) {
             "usage: voicecat <socket> [--mic FFMPEG_INPUT | --stdin-pcm | --stdin-mux [--realtime]]\n"
             "                [--whisper-model FILE] [--whisper-bin PATH] [--whisper-url URL]\n"
             "                [--barge-note TEXT] [--mouth-synth CMD --mouth-play CMD]\n"
-            "                [--commit-ms N=2500] [--hang-ms N=700] [--max-utt N=15] [--vad-level N=400] [--sound-tags]\n"
+            "                [--commit-ms N=2500] [--hang-ms N=700] [--max-utt N=15] [--vad-level N=400]\n"
             "                [--wordless-close N=2]  N consecutive whisper passes with zero words\n"
             "               close the utterance (~N x commit-ms into music/noise, vs max-utt's\n"
             "               15 s) — the ASR's own content verdict; any word resets it. 0 = off\n"
+            "  --sound-tags the ear's captions ([Music], (typing)) ride the turn's closing\n"
+            "               line once, raw and deduped — the system prompt teaches the form.\n"
+            "               They never enter the word stream, so wordless-close still fires\n"
             "                [--listener [--probe-ms N=1500] [--probe-gen N=6] [--probe-suffix TEXT]]\n"
             "  --mic        ffmpeg input spec (default \"-f alsa -i default\" on Linux)\n"
             "  --stdin-pcm  mono 16 kHz s16 PCM on stdin instead of a mic\n"
@@ -1498,7 +1522,7 @@ int main(int argc, char **argv) {
                     in_utt = 1; sil_ms = 0; onset = 0; pause_probed = 0;
                     committed = 0; trimmed = 0; ptail[0] = 0;
                     prev[0] = 0; last_pass = 0; last_voice = ub_n; turn_open = 0;
-                    wordless = 0;
+                    wordless = 0; g_utt_tags[0] = 0;
                     utt_talker = talker_live();          // sticky below: the tracker's
                                                          // report may lag a first word
                 }
@@ -1647,6 +1671,12 @@ int main(int argc, char **argv) {
                 }
                 if (turn_open || line[0]) {              // silence/false trigger sends nothing
                     size_t L = strlen(line);
+                    size_t T = strlen(g_utt_tags);       // the ear's captions ride the close,
+                    if (T && L + T < sizeof line - 2) {  // once — " [Music]", raw and deduped
+                        memcpy(line + L, g_utt_tags, T + 1);
+                        L += T;
+                        fprintf(stderr, "voicecat: ear noted%s\n", g_utt_tags);
+                    }
                     if (L > sizeof line - 2) L = sizeof line - 2;
                     line[L] = '\n'; line[L + 1] = 0;
                     send_all(s, line, L + 1);

@@ -48,6 +48,9 @@
 
 #include "lg_media_proto.h"
 #include "aec.h"
+#ifdef FF_XVF
+#include <libusb-1.0/libusb.h>
+#endif
 
 #define RATE   16000
 #define BLOCK  160                       // 10 ms — the canceller's frame
@@ -126,6 +129,72 @@ static void tap_cast(const int16_t *clean, const int16_t *raw) {
     }
     pthread_mutex_unlock(&t_mx);
 }
+
+// ---- the chip's own tracker (XVF3800, --scene stage 1.5) ------------------------
+// The array's XMOS pipeline runs a per-beam SPEECH detector we can read over
+// USB vendor control transfers: AEC_SPENERGY_VALUES — the vendor's own doc:
+// "Any value above 0 indicates speech" — dereverbed, echo-immune (self-played
+// music measured exactly 0.000 on all beams while a beam visibly tracked it),
+// and distance-robust where our coarse 44 mm correlator is not (measured: at
+// desk distance normal speech peaked the histogram at str 0.0-0.5 vs music
+// 0.0-0.8 — inseparable; the raised voice of talking OVER music promoted at
+// 1.6-4.8). So when the chip is reachable its verdict OUTRANKS the histogram
+// as the 'S'-frame talker source; the histogram stays as the fallback and the
+// research instrument. A poller thread does the reads — a control transfer's
+// timeout must never stall the duplex loop's 10 ms metronome.
+static volatile int    g_chip_alive = 0, g_chip_talker = 0;
+static volatile double g_chip_az = 0, g_chip_spe = 0;
+static double g_spe_thr = 0.0;               // --spe-thr: "above 0 indicates speech"
+
+#ifdef FF_XVF
+static libusb_device_handle *g_xvf = NULL;
+static int xvf_read4(uint8_t resid, uint8_t cmdid, float out[4]) {
+    uint8_t buf[17];                         // status byte + 4 LE floats
+    for (int tries = 0; tries < 8; tries++) {
+        int k = libusb_control_transfer(g_xvf, 0xC0, 0, (uint16_t)(0x80 | cmdid), resid,
+                                        buf, sizeof buf, 15);
+        if (k == (int)sizeof buf && buf[0] == 0) { memcpy(out, buf + 1, 16); return 0; }
+        if (k < 0) return -1;                // stack/device error: don't spin
+        usleep(2000);                        // status 64 = servicer says retry
+    }
+    return -1;
+}
+static void *xvf_main(void *arg) {
+    (void)arg;
+    float spe[4], azi[4];
+    int fails = 0;
+    for (;; usleep(450000)) {                // the scene report cadence
+        if (xvf_read4(33, 80, spe) != 0) {   // AEC_SPENERGY_VALUES
+            if (++fails >= 3) g_chip_alive = 0;
+            continue;
+        }
+        fails = 0;
+        int best = 0;
+        for (int i = 1; i < 4; i++) if (spe[i] > spe[best]) best = i;
+        g_chip_spe = spe[best];
+        int talk = spe[best] > g_spe_thr;
+        if (talk && xvf_read4(33, 75, azi) == 0)             // AEC_AZIMUTH_VALUES
+            g_chip_az = azi[best] * (180.0 / M_PI);          // chip frame, raw degrees
+        g_chip_talker = talk;
+        g_chip_alive = 1;
+    }
+    return NULL;
+}
+static void xvf_open(void) {
+    if (libusb_init(NULL) != 0) return;
+    g_xvf = libusb_open_device_with_vid_pid(NULL, 0x2886, 0x001e);
+    if (!g_xvf) {
+        fprintf(stderr, "far-field-service: XVF3800 control unreachable (udev rule?) — histogram only\n");
+        return;
+    }
+    pthread_t th;
+    pthread_create(&th, NULL, xvf_main, NULL);
+    pthread_detach(th);
+    fprintf(stderr, "far-field-service: XVF3800 speech tracker on (spe-thr %.3f)\n", g_spe_thr);
+}
+#else
+static void xvf_open(void) {}
+#endif
 
 // The tracker's verdict to every scene tap, at report cadence (~0.45 s).
 // tap_cast's discipline: a full pipe drops the report (the next is half a
@@ -351,6 +420,19 @@ static void scene_process(const int16_t *tick) {
     double paz = 0, pl = -1;
     for (int t = 0; t < ntr; t++)
         if (tr[t].last == scwin && tr[t].lvl > pl) { present = 1; paz = tr[t].az; pl = tr[t].lvl; }
+    // the chip's speech tracker outranks the histogram when reachable —
+    // dereverbed, echo-immune, distance-robust (see xvf_main); transitions
+    // land in this log so a live session can be read from one file
+    if (g_chip_alive) {
+        static int chip_last = -1;
+        if (g_chip_talker != chip_last) {
+            chip_last = g_chip_talker;
+            fprintf(stderr, "%s scene: chip %s (spe=%.3f az=%+.0f)\n",
+                    ts, g_chip_talker ? "TALKER" : "quiet ", g_chip_spe, g_chip_az);
+        }
+        present = g_chip_talker;
+        paz = g_chip_az;
+    }
     scene_cast(present, paz);
     recent = 0;
     for (int t = 0; t < ntr; ) {                          // a bearing gone quiet 2 reports -> GONE
@@ -659,6 +741,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--duck-db") && i + 1 < argc)      g_duck_gain = pow(10.0, -atof(argv[++i]) / 20.0);
         else if (!strcmp(argv[i], "--no-aec"))                       g_no_aec = 1;
         else if (!strcmp(argv[i], "--scene"))                        g_scene = 1;
+        else if (!strcmp(argv[i], "--spe-thr") && i + 1 < argc)      g_spe_thr = atof(argv[++i]);
         else {
             fprintf(stderr, "far-field-service: unknown argument %s\n", argv[i]);
             return 1;
@@ -679,6 +762,7 @@ int main(int argc, char **argv) {
     }
     if (g_use_ch >= g_channels) { fprintf(stderr, "far-field-service: --use-channel out of range\n"); return 1; }
     if (g_scene && g_channels < 6) { fprintf(stderr, "far-field-service: --scene needs the 4 raw mics (run --channels 6)\n"); g_scene = 0; }
+    if (g_scene) xvf_open();                 // the chip's speech tracker, when reachable
 
     if (!g_no_aec) {
         g_aec = aec_new(RATE);               // which impl = link time (aec.h seam);

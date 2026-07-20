@@ -227,8 +227,35 @@ barged mid-sentence, then *"(interrupting) short version please"* → a one-sent
 summary, context intact.)
 
 Turn-taking assumes the mic doesn't hear the speakers — a headset, or echo
-cancellation upstream; an open-air mic will barge on its own TTS. Whisper must
-run faster than real time (tiny/base on a GPU), or commits fall behind capture.
+cancellation upstream (far-field-service below is that, for open air); an
+open-air mic without it will barge on its own TTS. Whisper must run faster
+than real time (tiny/base on a GPU), or commits fall behind capture. While a
+reply is audible, the bar to open an utterance is higher and longer
+(`--barge-mult`, `--barge-onset` — the browser demo's rule), so echo
+residue can't cut the mouth but a firm voice can. With `--duck-sock` the
+barge is TWO-STAGE: onset ducks the reply (12 dB down, still talking), the
+hard cut waits for words to materialize, and a false alarm — a door, a
+cough — swells the reply back instead of killing it.
+
+### The mouth, owned (`--mouth-synth` / `--mouth-play`)
+
+With these set, voicecat OWNS the TTS instead of piping stdout onward:
+clause splitting runs in-process (clausecat's policy verbatim), the synth
+(`piper --output-mux --stream`) is spawned once and stays warm, and its PCM
+pumps through a ring into a small player process. A barge then kills ONLY
+the player — the sound stops within its buffer — and a `set_voice` sentinel
+dropped down piper's stdin marks, via its `M`-frame echo, exactly which
+queued audio is stale. voicecat tracks an audible-horizon clock (bytes
+handed to the player over the stream rate), so "the mouth is speaking" stays
+true for the whole utterance even though the synth finishes seconds early.
+Verified: of four replies in flight around a barge, the played audio
+contained only the post-barge one.
+
+`--whisper-url` points the ASR passes at a resident `whisper-server`
+`/inference` endpoint instead of spawning whisper-cli per pass (~0.36 s vs
+0.55 — whisper's 30 s-padded encoder is the remaining floor, so a streaming
+ASR behind the same URL is the future drop-in); with fast passes,
+`--commit-ms 1100` streams transcripts mid-utterance.
 
 ### Example, and testing without a mic
 
@@ -319,15 +346,31 @@ One conversation per app run (the serve connection lives as long as the
 process, so multi-turn context works); one user at a time, by design — it is
 a demo, not a server.
 
+## far-field-service — the audio authority
+
+One process owns both directions of the sound card: echo cancellation runs
+where the playback reference lives (webrtc AEC3 behind a swappable C seam —
+hardware-AEC arrays run it in pass-through), clean and raw microphone taps
+and one TTS mouth ride an AF_UNIX socket, and killing the mouth client IS
+the barge-in cut. Linux-only; `script/far-field.sh start|stop|status` is the
+lifecycle and `script/speakerphone.sh` composes the full open-air voice loop
+with voicecat. The design, the wire, the build notes (webrtc-audio-processing
+1.x from source), and the paid-for real-time audio rules live in
+**[docs/far-field-service.md](docs/far-field-service.md)** — a topic of its
+own, with direction-of-arrival and beam metadata on its roadmap.
+
 ## Build
 ```sh
 cmake -S . -B build && cmake --build build --config Release
 # -> build/mmcat, build/voicecat, build/clausecat (build/Release/*.exe on Windows)
+# -> build/far-field-service on Linux when libpulse-simple is found (plus
+#    webrtc AEC3 when webrtc-audio-processing-1 and a C++ compiler are; the
+#    rest of the repo is plain C and needs no C++ anywhere)
 ```
 Runtime: `ffmpeg` and `ffprobe` on `PATH`; `whisper-cli` + a whisper.cpp model for
 mmcat's captions/soundtrack transcripts and voicecat's streaming mode (point at
 them with `--whisper-model` / `--whisper-bin` or `LG_WHISPER_MODEL` /
-`LG_WHISPER_BIN`).
+`LG_WHISPER_BIN`), or a resident `whisper-server` via `--whisper-url`.
 
 ## License
 MIT (see `LICENSE`), matching little-gemma.

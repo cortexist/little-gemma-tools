@@ -28,8 +28,10 @@
 #define LINE_MAX_ 8192
 #define TAG_MAX  26                     // '<' + up to 24 chars + '>'
 #define SPAN_MAX 4096                   // a <|tool_call> control span
+#define TAGSPAN_MAX 64                  // a [[key:value]] inline tag
 
 static const char *g_allow = NULL;      // --allow-control-token pattern
+static int g_route_emotion = 0;         // --route-emotion: [[emotion:X]] -> set_voice line
 
 // Wildcard match, '*' = any run of characters (the classic iterative form).
 static int glob_match(const char *s, const char *p) {
@@ -76,18 +78,24 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--allow-control-token") && i + 1 < argc)
             g_allow = argv[++i];
+        else if (!strcmp(argv[i], "--route-emotion"))
+            g_route_emotion = 1;
         else bad = 1;
     }
     if (bad) {
         fprintf(stderr,
-            "usage: clausecat [--allow-control-token PATTERN]\n"
+            "usage: clausecat [--allow-control-token PATTERN] [--route-emotion]\n"
             "  raw reply stream on stdin -> one clause per line on stdout\n"
             "  --allow-control-token   a <|tool_call>...<tool_call|> span matching\n"
             "                          PATTERN ('*' = any run) passes through verbatim\n"
             "                          as its own line, ordered against the clauses;\n"
             "                          e.g. '<|tool_call>call:set_voice{*}<tool_call|>'\n"
             "                          (non-matching spans are dropped whole — their\n"
-            "                          payload is never spoken)\n");
+            "                          payload is never spoken)\n"
+            "  --route-emotion         a [[emotion:X]] inline tag becomes piper's\n"
+            "                          set_voice control line, ordered against the\n"
+            "                          clauses (inline tags are never spoken; unknown\n"
+            "                          [[...]] tags are dropped whole either way)\n");
         return 1;
     }
 #ifdef _WIN32
@@ -104,15 +112,21 @@ int main(int argc, char **argv) {
     int tcall = 0;                      // inside <|tool_call> ... <tool_call|>
     const char *tclose = "<tool_call|>";
     size_t tcn = 0;
+    char tsp[TAGSPAN_MAX];              // a [[key:value]] inline tag being captured
+    size_t bn = 0;
+    int brk = 0;                        // inside [[ ... ]]
+    int pb = 0;                         // a pending lone '[' (may open a tag)
 
     int ci;
     while ((ci = getchar()) != EOF) {
         char c = (char)ci;
-        if (c == '\n') {                // end of turn: pending '<...' was literal text
-            if (!thought && !tcall)
+        if (c == '\n') {                // end of turn: pending '<...'/'[' was literal
+            if (!thought && !tcall) {   // text; an unterminated [[ span is dropped
+                if (pb) emit('[');
                 for (size_t i = 0; i < tn; i++) emit(tag[i]);
+            }
             flush_line();
-            tn = 0; thought = 0; cn = 0; tcall = 0; sn = 0; tcn = 0;
+            tn = 0; thought = 0; cn = 0; tcall = 0; sn = 0; tcn = 0; pb = 0; brk = 0; bn = 0;
             continue;
         }
         if (thought) {                  // discard until the exact close marker
@@ -153,11 +167,37 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < tn; i++) emit(tag[i]);   // too long or '<': literal
             tn = 0;                     // fall through: c starts over
         }
+        if (brk) {                      // capture a [[...]] inline tag until "]]"
+            if (c == ']' && bn > 0 && tsp[bn - 1] == ']') {
+                tsp[--bn] = 0;
+                // [[emotion:X]] -> piper's voice-switch line (--route-emotion);
+                // every other tag drops whole — inline tags are control, not speech
+                if (g_route_emotion && !strncmp(tsp, "emotion:", 8) && tsp[8]) {
+                    flush_line();       // the switch holds its place among the clauses
+                    printf("<|tool_call>call:set_voice{speaker_id:<|\"|>%s<|\"|>}<tool_call|>\n", tsp + 8);
+                    fflush(stdout);
+                }
+                brk = 0; bn = 0;
+                continue;
+            }
+            if (bn < sizeof tsp - 1) { tsp[bn++] = c; continue; }
+            emit('['); emit('[');       // overflow: it was literal text after all
+            for (size_t i = 0; i < bn; i++) emit(tsp[i]);
+            brk = 0; bn = 0;            // fall through: c starts over
+        }
+        if (pb) {
+            pb = 0;
+            if (c == '[') { brk = 1; bn = 0; continue; }    // "[[" opens a tag span
+            emit('[');                  // a lone '[' was literal text
+        }
+        if (c == '[') { pb = 1; continue; }
         if (c == '<') { tag[tn++] = c; continue; }
         emit(c);
     }
-    if (!thought && !tcall)
+    if (!thought && !tcall) {
+        if (pb) emit('[');
         for (size_t i = 0; i < tn; i++) emit(tag[i]);
+    }
     flush_line();
     return 0;
 }

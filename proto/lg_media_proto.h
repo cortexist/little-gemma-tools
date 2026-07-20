@@ -33,6 +33,15 @@
 // reply included) continues. Sent between turns it is ignored.
 #define LG_BARGE       0x02
 
+// Listener probe (duplex prototype): a 'P' frame sent while the user turn is
+// still OPEN — "if the turn ended right here, what would you say?". w = max
+// tokens to decode (0 -> the runner's default), h = 0, payload (>= 1 byte) =
+// a steering suffix appended inside the user turn before the dry-run close.
+// The runner answers mid-turn with "<|probe>text<probe|>\n" and rolls the
+// context back, so probes never change the conversation. Send only while
+// LISTENING (never with a reply pending).
+#define LG_FRAME_PROBE 'P'
+
 #define LG_PATCH   48      // pixels per patch side; image dims must be multiples
 #define LG_RATE    16000   // audio sample rate (mono s16)
 #define LG_FRAME   640     // samples per audio frame (40 ms @ 16 kHz)

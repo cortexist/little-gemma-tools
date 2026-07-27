@@ -136,7 +136,7 @@ static void tag_note(const char *t, size_t n) {
 // While a reply is live (pending, or the mouth still sounding) the bar to
 // open an utterance is HIGHER and LONGER — the browser demo's BARGE_THRESH
 // rule: echo residuals and AEC startup transients must not cut the mouth.
-static int g_barge_mult = 2, g_barge_onset = 6;
+static int g_barge_mult = 2, g_barge_onset = 6, g_barge_hang = 0;
 // --stdin-mux: stdin carries far-field-service's framed tap ('P' pcm with
 // 'S' scene verdicts riding along) instead of bare PCM. With --scene-gate
 // on top, `voiced` needs energy AND a live localized talker, so sustained
@@ -686,8 +686,8 @@ static long m_marks_sent = 0, m_marks_seen = 0;
 static int  m_mute_turn = 0;                 // post-barge: eat the dying reply's tail clauses
 static struct { uint8_t head[5]; uint32_t hn, len, got; uint8_t kind; char meta[64]; uint32_t mn; } m_fr;
 
-// clausecat's machine, verbatim policy (no --allow-control-token, no
-// --route-emotion here yet): thought spans and <tokens> dropped, [[tags]]
+// clausecat's machine (no --allow-control-token; --route-emotion IS handled
+// here now, see m_is_mood/[mood] below): thought spans and <tokens> dropped, [[tags]]
 // dropped whole, a clause line flushes at punctuation + space.
 static struct {
     char line[8192]; size_t ln;
@@ -695,7 +695,7 @@ static struct {
     int thought;     size_t cn;
     int tcall;       size_t tcn;
     char tsp[64];    size_t bn;
-    int brk, pb;
+    int brk, pb, mtag;
 } m_cl;
 
 static int spawn_cmd(const char *cmd, int *in_fd, int *out_fd) {
@@ -864,6 +864,34 @@ static void m_emit(char c) {
     if (m_cl.ln < sizeof m_cl.line - 2) m_cl.line[m_cl.ln++] = c;
 }
 
+// The reply stream carries a low-cost mood tag: a bare [happy] / [sad] /
+// [angry] / [neutral], the cheap successor to the old <|tool_call>set_voice{...}
+// span (which cost the model far more tokens to emit). voicecat inherited
+// clausecat's parser WITHOUT its --route-emotion stage, so single-bracket tags
+// fell through to m_emit and piper SPOKE the word "happy". Strip them always;
+// --mood-route additionally retargets piper's speaker, which needs a
+// MULTI-SPEAKER voice (a single-speaker onnx answers "no speaker 'happy'").
+static int g_mood_route = 0;
+static int m_is_mood(const char *s) {
+    static const char *v[] = { "happy", "sad", "angry", "neutral", NULL };
+    for (int i = 0; v[i]; i++) if (!strcmp(s, v[i])) return 1;
+    return 0;
+}
+// [nod] / [shake] / [quiet]: the actuator channel. voicebox has no display, so
+// here they are simply never spoken; the robot's driver hooks in at this point.
+static int m_is_gesture(const char *s) {
+    static const char *v[] = { "nod", "shake", "quiet", NULL };
+    for (int i = 0; v[i]; i++) if (!strcmp(s, v[i])) return 1;
+    return 0;
+}
+static void m_set_voice(const char *name) {
+    if (m_synth_in < 0) return;
+    char buf[128];
+    int n = snprintf(buf, sizeof buf,
+        "<|tool_call>call:set_voice{speaker_id:<|\"|>%s<|\"|>}<tool_call|>\n", name);
+    if (n > 0 && n < (int)sizeof buf && write(m_synth_in, buf, (size_t)n) != n) { /* piper gone */ }
+}
+
 static void mouth_feed(const char *in, int n) {
     if (!g_mouth_synth) return;
     static const char CLOSE[] = "<channel|>", TCLOSE[] = "<tool_call|>";
@@ -876,6 +904,7 @@ static void mouth_feed(const char *in, int n) {
         if (c == '\n') {                     // end of turn: pending '<...'/'[' was literal
             if (!m_cl.thought && !m_cl.tcall) {
                 if (m_cl.pb) m_emit('[');
+                if (m_cl.mtag) { m_emit('['); for (size_t j = 0; j < m_cl.bn; j++) m_emit(m_cl.tsp[j]); }
                 for (size_t j = 0; j < m_cl.tn; j++) m_emit(m_cl.tag[j]);
             }
             m_flush_line();
@@ -905,6 +934,21 @@ static void mouth_feed(const char *in, int n) {
             for (size_t j = 0; j < m_cl.tn; j++) m_emit(m_cl.tag[j]);
             m_cl.tn = 0;
         }
+        if (m_cl.mtag) {                     // [happy] — the low-cost mood tag
+            if (c == ']') {
+                m_cl.tsp[m_cl.bn] = 0;
+                if (m_is_mood(m_cl.tsp)) { if (g_mood_route) m_set_voice(m_cl.tsp); }
+                else if (m_is_gesture(m_cl.tsp)) { /* actuator only: never spoken */ }
+                else { m_emit('['); for (size_t j = 0; j < m_cl.bn; j++) m_emit(m_cl.tsp[j]); m_emit(']'); }
+                m_cl.mtag = 0; m_cl.bn = 0; continue;
+            }
+            if (m_cl.bn < 12 && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+                m_cl.tsp[m_cl.bn++] = c; continue;
+            }
+            m_emit('[');                     // not a tag after all: hand it back verbatim
+            for (size_t j = 0; j < m_cl.bn; j++) m_emit(m_cl.tsp[j]);
+            m_cl.mtag = 0; m_cl.bn = 0;
+        }
         if (m_cl.brk) {                      // [[...]] inline tags are control, not speech
             if (c == ']' && m_cl.bn > 0 && m_cl.tsp[m_cl.bn - 1] == ']') { m_cl.brk = 0; m_cl.bn = 0; continue; }
             if (m_cl.bn < sizeof m_cl.tsp - 1) { m_cl.tsp[m_cl.bn++] = c; continue; }
@@ -915,6 +959,9 @@ static void mouth_feed(const char *in, int n) {
         if (m_cl.pb) {
             m_cl.pb = 0;
             if (c == '[') { m_cl.brk = 1; m_cl.bn = 0; continue; }
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {   // maybe [mood]
+                m_cl.mtag = 1; m_cl.bn = 0; m_cl.tsp[m_cl.bn++] = c; continue;
+            }
             m_emit('[');
         }
         if (c == '[') { m_cl.pb = 1; continue; }
@@ -1278,13 +1325,53 @@ static int agree_words(const char *a, const char *b) {
     }
 }
 
+// ---- ReSpeaker capture profile ------------------------------------------------
+// The XVF3800 presents SIX capture channels and only ONE is what ASR wants: ch0,
+// the AEC'd + AGC'd beamformer output. Measured on the circular board: ch0 is
+// +27.1 dB speech SNR against +17.0 for the best raw-mic channel, and during echo
+// it sits ~17 dB below a six-channel mix. ffmpeg's -ac 1 AVERAGES, diluting ch0 to
+// a sixth while the echo the other five carry sums coherently. So: SELECT, never
+// average. The ALSA card id encodes the firmware config, {C|L}{16K|48K}{2|6}Ch
+// (C/L = circular/linear); match the PATTERN, not a literal name, so reflashing
+// for the other array keeps working with no code change.
+#ifndef _WIN32
+static int respeaker_card(char *out, size_t n) {
+    FILE *f = fopen("/proc/asound/cards", "r");
+    if (!f) return 0;
+    char line[512];
+    int hit = 0;
+    while (!hit && fgets(line, sizeof line, f)) {
+        const char *lb = strchr(line, '['), *rb = lb ? strchr(lb, ']') : NULL;
+        if (!lb || !rb) continue;
+        char id[64]; size_t len = 0;
+        for (const char *q = lb + 1; q < rb && len + 1 < sizeof id; q++)
+            if (*q != ' ') id[len++] = *q;
+        id[len] = 0;
+        const char *q = id;
+        if (*q != 'C' && *q != 'L') continue;
+        q++;
+        if (*q < '0' || *q > '9') continue;
+        while (*q >= '0' && *q <= '9') q++;
+        if (*q++ != 'K') continue;
+        if (*q < '0' || *q > '9') continue;
+        while (*q >= '0' && *q <= '9') q++;
+        if (strcmp(q, "Ch")) continue;
+        snprintf(out, n, "%s", id);
+        hit = 1;
+    }
+    fclose(f);
+    return hit;
+}
+#endif
+
 // ---- the conversation ---------------------------------------------------------
 int main(int argc, char **argv) {
     const char *spath = NULL, *mic = NULL;
-    int stdin_pcm = 0;
+    int stdin_pcm = 0, asr_ch = -2;          // -2 unset (auto), -1 average all, >=0 pick
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--mic") && i + 1 < argc)           mic = argv[++i];
         else if (!strcmp(argv[i], "--stdin-pcm"))                     stdin_pcm = 1;
+        else if (!strcmp(argv[i], "--asr-ch") && i + 1 < argc)         asr_ch = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--stdin-mux"))                     stdin_pcm = g_stdin_mux = 1;
         else if (!strcmp(argv[i], "--scene-gate"))                    g_scene_gate = 1;
         else if (!strcmp(argv[i], "--talker-hold") && i + 1 < argc)   g_talker_hold = atoi(argv[++i]);
@@ -1297,6 +1384,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--hush-tail"))                     g_hush_tail = 1;
         else if (!strcmp(argv[i], "--barge-mult") && i + 1 < argc)    g_barge_mult = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--barge-onset") && i + 1 < argc)   g_barge_onset = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--barge-hang") && i + 1 < argc)    g_barge_hang = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--duck-sock") && i + 1 < argc)     g_duck_sock = argv[++i];
         else if (!strcmp(argv[i], "--barge-note") && i + 1 < argc)    g_barge_note = argv[++i];
         else if (!strcmp(argv[i], "--commit-ms") && i + 1 < argc)     g_commit_ms = atoi(argv[++i]);
@@ -1304,6 +1392,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--max-utt") && i + 1 < argc)       g_max_utt = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--wordless-close") && i + 1 < argc) g_wordless = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--sound-tags"))                    g_sound_tags = 1;
+        else if (!strcmp(argv[i], "--mood-route"))                    g_mood_route = 1;
         else if (!strcmp(argv[i], "--vad-level") && i + 1 < argc)     g_vad = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--listener"))                      g_listener = 1;
         else if (!strcmp(argv[i], "--probe-ms") && i + 1 < argc)      g_probe_ms = atoi(argv[++i]);
@@ -1328,7 +1417,12 @@ int main(int argc, char **argv) {
             "               line once, raw and deduped — the system prompt teaches the form.\n"
             "               They never enter the word stream, so wordless-close still fires\n"
             "                [--listener [--probe-ms N=1500] [--probe-gen N=6] [--probe-suffix TEXT]]\n"
-            "  --mic        ffmpeg input spec (default \"-f alsa -i default\" on Linux)\n"
+            "  --mic        ffmpeg input spec (default: auto-detect a ReSpeaker card,\n"
+            "               else \"-f alsa -i default\" on Linux)\n"
+            "  --asr-ch N   take capture channel N instead of averaging all of them.\n"
+            "               Auto-set to 0 on a ReSpeaker (its beamformed, echo-cancelled\n"
+            "               output); averaging that array re-injects echo. -1 forces the\n"
+            "               old average-all behaviour\n"
             "  --stdin-pcm  mono 16 kHz s16 PCM on stdin instead of a mic\n"
             "  --stdin-mux  far-field-service --tap --mux frames on stdin: pcm plus the\n"
             "               scene tracker's talker verdicts (parsed and logged always)\n"
@@ -1395,11 +1489,27 @@ int main(int argc, char **argv) {
     } else {
 #ifdef _WIN32
         if (!mic) { fprintf(stderr, "voicecat: --mic \"-f dshow -i audio=...\" is required on Windows\n"); return 1; }
+        char down[64];
 #else
-        if (!mic) mic = "-f alsa -i default";
+        char down[64], autospec[128], card[64];
+        if (!mic && respeaker_card(card, sizeof card)) {    // pin the array, not ALSA "default"
+            snprintf(autospec, sizeof autospec, "-f alsa -i hw:CARD=%s", card);
+            mic = autospec;
+            if (asr_ch == -2) asr_ch = 0;                   // ch0 = the beamformed/AEC output
+            if (asr_ch >= 0)
+                fprintf(stderr, "voicecat: ReSpeaker %s detected - taking ch%d (beamformed/AEC output)\n", card, asr_ch);
+            else
+                fprintf(stderr, "voicecat: ReSpeaker %s detected but --asr-ch -1 given - averaging all channels\n", card);
+        }
+        if (!mic) mic = "-f alsa -i default";               // detection FIRST, default only after
 #endif
+        // Selecting one channel; -ac 1 would AVERAGE them (see respeaker_card).
+        // -nostdin: ffmpeg reads stdin for keyboard commands by default and will
+        // eat bytes meant for us.
+        if (asr_ch >= 0) snprintf(down, sizeof down, "-af \"pan=mono|c0=c%d\"", asr_ch);
+        else             snprintf(down, sizeof down, "-ac 1");
         char cmd[2048];
-        snprintf(cmd, sizeof cmd, "ffmpeg -hide_banner -loglevel error %s -f s16le -ac 1 -ar %d -", mic, LG_RATE);
+        snprintf(cmd, sizeof cmd, "ffmpeg -nostdin -hide_banner -loglevel error %s -f s16le %s -ar %d -", mic, down, LG_RATE);
         src = run_pipe(cmd);
         if (!src) { fprintf(stderr, "voicecat: ffmpeg capture failed\n"); return 1; }
     }
@@ -1429,7 +1539,7 @@ int main(int argc, char **argv) {
     char ptail[400] = "";                            // trimmed text tail -> whisper --prompt
     size_t last_pass = 0;                            // ub_n at the previous whisper pass
     size_t last_voice = 0;                           // ub_n at the last voiced frame
-    int in_utt = 0, onset = 0, sil_ms = 0, turn_open = 0, barged = 0, pause_probed = 0;
+    int in_utt = 0, onset = 0, onset_miss = 0, sil_ms = 0, turn_open = 0, barged = 0, pause_probed = 0;
     int utt_talker = 0;                              // a live talker owned this utterance at
                                                      // some point (always 1 with the gate unarmed)
     int wordless = 0;                                // consecutive mid-passes with zero words
@@ -1497,7 +1607,16 @@ int main(int argc, char **argv) {
                 memcpy(ring + (PREROLL - 1) * FR_SAMP, frame, sizeof frame);
                 if (ring_n < PREROLL) ring_n++;
                 int busy = pending > 0 || mouth_speaking();
-                onset = (rms >= (busy ? g_vad * g_barge_mult : g_vad)) ? onset + 1 : 0;
+                // A strict consecutive-frame run is the wrong shape for speech: a word
+                // ending in a stop consonant ("wait a second" -> the /t/ closure) goes
+                // silent for 60-140 ms mid-phrase, which zeroed the counter -- so such
+                // phrases could NEVER barge while "hold on" (continuously voiced) always
+                // did. Measured 2026-07-26: same speaker, same level, "wait a second"
+                // put MORE frames over threshold (22 vs 17) yet its longest RUN was 12
+                // vs 17. --barge-hang tolerates that many sub-threshold frames before
+                // the run resets; 0 keeps the old strict behaviour.
+                if (rms >= (busy ? g_vad * g_barge_mult : g_vad)) { onset++; onset_miss = 0; }
+                else if (++onset_miss > g_barge_hang)             { onset = 0; onset_miss = 0; }
                 if (onset >= (busy ? g_barge_onset : ONSET)) {   // an utterance begins
                     if (busy && g_duck_fd != INVALID_SOCKET) {   // stage 1: duck, keep
                         duck_set(1);                     // talking — the cut waits for
@@ -1519,7 +1638,7 @@ int main(int argc, char **argv) {
                     if (ub_cap < pre + FR_SAMP) { ub_cap = 1 << 20; ub = realloc(ub, ub_cap * 2); }
                     memcpy(ub, ring + (PREROLL - ring_n) * FR_SAMP, pre * 2);
                     ub_n = pre;
-                    in_utt = 1; sil_ms = 0; onset = 0; pause_probed = 0;
+                    in_utt = 1; sil_ms = 0; onset = 0; onset_miss = 0; pause_probed = 0;
                     committed = 0; trimmed = 0; ptail[0] = 0;
                     prev[0] = 0; last_pass = 0; last_voice = ub_n; turn_open = 0;
                     wordless = 0; g_utt_tags[0] = 0;

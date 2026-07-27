@@ -58,6 +58,16 @@ CHANNEL = re.compile(r"<\|channel>.*?(<channel\|>|$)", re.S)
 ALLOW_CONTROL = "<|tool_call>call:set_voice{*}<tool_call|>"
 SET_VOICE = re.compile(r"set_voice\s*\{(.*)\}")
 
+# The house tag the model emits now is a bare [happy] / [nod] — the low-cost
+# successor to both the set_voice span and the [[emotion:X]] inline tag (each
+# cost the model far more tokens). ONE tag, INDEPENDENT consumers: a mood BOTH
+# retargets piper's speaker_id (TTS) AND drives the face (on the robot that is
+# the actuator driver, a separate channel); a gesture drives only the face
+# animation and never reaches TTS. "quiet" means no gesture, as in probe().
+MOODS = ("happy", "sad", "angry", "neutral")
+GESTURES = ("nod", "shake", "quiet")
+SET_VOICE_SPAN = '<|tool_call>call:set_voice{speaker_id:<|"|>%s<|"|>}<tool_call|>' 
+
 
 def speakable(raw):
     return TAG.sub("", CHANNEL.sub("", raw))
@@ -409,11 +419,33 @@ class Pipeline:
                         """[[emotion:X]] — the house inline tag; rendered as the
                         set_voice control line control() already knows how to
                         route (piper switches, the browser gets its M frame)."""
-                        control('<|tool_call>call:set_voice{speaker_id:<|"|>%s<|"|>}<tool_call|>' % value)
+                        control(SET_VOICE_SPAN % value)
+
+                    def mood(name):
+                        """[happy] — the bare tag. Unlike emotion() above this
+                        drives the M frame DIRECTLY rather than through control()'s
+                        mux round-trip, so the face moves under --phonemes and with
+                        a single-speaker voice; the two channels are independent."""
+                        flush()                              # hold its place among clauses
+                        try:
+                            self.piper.stdin.write((SET_VOICE_SPAN % name).encode("utf-8") + b"\n")
+                            self.piper.stdin.flush()
+                        except (BrokenPipeError, OSError):   # face still moves, voice does not
+                            pass
+                        q.put(frame(b"M", name.encode("utf-8")))
+
+                    def gesture(name):
+                        """[nod] / [shake] — actuator only, never spoken. Reuses the
+                        N frame the listener probe already drives."""
+                        if name == "quiet":                  # "no gesture", as in probe()
+                            return
+                        flush()
+                        q.put(frame(b"N", name.encode("utf-8")))
 
                     tag, thought, cn = "", False, 0
                     span, tcall, tcn = "", False, 0
                     tsp, brk, pb = "", False, False    # a [[key:value]] inline tag
+                    mtag, btag = False, ""             # a bare [happy] / [nod] tag
                     CLOSE, TCLOSE = "<channel|>", "<tool_call|>"
                     utf8 = codecs.getincrementaldecoder("utf-8")(errors="replace")
                     raw = b""
@@ -449,6 +481,26 @@ class Pipeline:
                                 for t in tag:
                                     add(t)
                                 tag = ""
+                            if mtag:                     # a bare [happy] / [nod]
+                                if c == "]":
+                                    if btag in MOODS:
+                                        mood(btag)
+                                    elif btag in GESTURES:
+                                        gesture(btag)
+                                    else:                    # not ours: speak it verbatim
+                                        add("[")
+                                        for t in btag:
+                                            add(t)
+                                        add("]")
+                                    mtag, btag = False, ""
+                                    continue
+                                if len(btag) < 12 and c.isalpha():
+                                    btag += c
+                                    continue
+                                add("[")                     # not a tag after all
+                                for t in btag:
+                                    add(t)
+                                mtag, btag = False, ""
                             if brk:                      # a [[...]] inline tag
                                 if c == "]" and tsp.endswith("]"):
                                     key = tsp[:-1]
@@ -467,6 +519,9 @@ class Pipeline:
                                 if c == "[":
                                     brk, tsp = True, ""
                                     continue
+                                if c.isalpha():              # maybe a bare [happy] / [nod]
+                                    mtag, btag = True, c
+                                    continue
                                 add("[")
                             if c == "[":
                                 pb = True
@@ -475,6 +530,10 @@ class Pipeline:
                                 tag = "<"
                                 continue
                             add(c)
+                    if mtag:                                 # a dangling "[tag" was literal
+                        add("[")
+                        for t in btag:
+                            add(t)
                     self.lg.stdout.read(1)                   # the client's trailing newline
                     flush()
                 finally:

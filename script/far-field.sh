@@ -42,9 +42,16 @@ start)
     rm -f "$sock"
     pactl set-sink-volume "$sink" "$vol" 2>/dev/null
     pactl set-source-volume "$src" 100% 2>/dev/null
+    # XVF3800 (2026-07-26, measured): ch0 is the chip's beamformed + AEC'd + AGC'd
+    # output -- the ONLY channel worth feeding ASR (+27.1 dB speech SNR vs +16.8 on
+    # ch1, and echo-immune: xcorr 0.0102 vs 0.4415 with the software canceller off).
+    # --use-channel 1 / --gain-db 12 were ReSpeaker Lite values for a quiet raw mic;
+    # on ch0 they fed the canceller an echoey channel AND clipped every speech peak
+    # (ch0 already peaks at -0.5 dBFS, so +12 dB is ~11 dB over full scale). --no-aec
+    # is safe because the chip's own AEC does the whole job on ch0.
     nohup "$bin" -s "$sock" \
         --source "$src" --sink "$sink" \
-        --channels 6 --use-channel 1 --gain-db 12 --scene \
+        --channels 6 --use-channel 0 --gain-db 0 --scene --no-aec \
         "$@" >"$log" 2>&1 &
     echo $! > "$pidf"
     for i in 1 2 3 4 5 6 7 8 9 10; do

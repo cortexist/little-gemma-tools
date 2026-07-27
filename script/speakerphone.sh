@@ -96,7 +96,12 @@ echo "speakerphone: talk when ready (ctrl-c to stop)" >&2
 # reply's tail is the user, not the echo.
 # --clock 0: E2B parrots the "[18:52]" turn-clock into speech (E4B+ uses it
 # silently as taught); keep time awareness off below the finetune boundary.
-# --barge-mult 8 / onset 5: AEC3's output gate holds the TTS residual near
+# --barge-mult 7 / onset 9 / hang 7: re-derived 2026-07-26 against measured
+# audio after --no-aec removed AEC3's output gate (the old 8/15 assumed it).
+# hang is the key one: a strict consecutive run zeroes on the /t/ closure in
+# "wait a second", so that phrase could never barge while "hold on" always
+# could. Chosen for margin: every test utterance clears onset by >=9 frames
+# and the TTS residual stays 8 frames short of triggering.
 # the noise floor (measured −78 dB), so the in-reply bar only needs to clear
 # noise, not echo — a firm word interrupts. (An earlier 4×/8 bar, set before
 # the gate proved itself, was unreachable on this deaf channel: barge never
@@ -107,7 +112,7 @@ echo "speakerphone: talk when ready (ctrl-c to stop)" >&2
 "$tools/far-field-service" --tap "$ffsock" --mux \
   | "$vc" "$sock" --stdin-mux \
       --vad-level 200 --hang-ms 500 --clock 0 --sound-tags --hush-tail \
-      --barge-mult 8 --barge-onset 15 --duck-sock "$ffsock" \
+      --barge-mult 7 --barge-onset 9 --barge-hang 7 --duck-sock "$ffsock" \
       --whisper-url "$wurl" --commit-ms 1100 \
       --mouth-synth "$piper -m $LG_VOICE --output-mux --stream" \
       --mouth-play  "$tools/far-field-service --speak $ffsock --rate $rate"

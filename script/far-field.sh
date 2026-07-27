@@ -21,8 +21,13 @@ pidf=/tmp/far-field-service.pid
 here="$(cd "$(dirname "$0")" && pwd)"
 bin="$here/../build/far-field-service"
 [ -x "$bin" ] || bin=far-field-service
-src=alsa_input.usb-Seeed_Studio_reSpeaker_Flex_XVF3800_C16K6Ch_100005504261800275-00.multichannel-input
-sink=alsa_output.usb-Seeed_Studio_reSpeaker_Flex_XVF3800_C16K6Ch_100005504261800275-00.analog-stereo
+# The PulseAudio names carry BOTH the firmware config AND the board serial
+# (..._L16K6Ch_100099135261800096-00...), so both change on a board swap or a
+# reflash -- the hardcoded C16K6Ch pair broke silently on 2026-07-27 when the
+# linear board went in. Discover by pattern, the same lesson as voicecat s card
+# matching. FF_SRC / FF_SINK override for a second device or a non-Seeed card.
+src="${FF_SRC:-$(pactl list short sources 2>/dev/null | awk '/reSpeaker_Flex_XVF3800.*multichannel-input/{print $2; exit}')}"
+sink="${FF_SINK:-$(pactl list short sinks 2>/dev/null | awk '/reSpeaker_Flex_XVF3800.*analog-stereo/{print $2; exit}')}"
 vol=100%                              # pinned BEFORE launch: the sink volume is
                                      # part of the echo path the priming hiss
                                      # teaches — changing it mid-session forces
@@ -39,6 +44,10 @@ start)
         echo "far-field: already running (socket $sock, pid $(cat "$pidf"))"
         exit 0
     fi
+    [ -n "$src" ] && [ -n "$sink" ] || {
+        echo "far-field: no reSpeaker XVF3800 source/sink in pactl - is the board plugged in?"
+        exit 1
+    }
     rm -f "$sock"
     pactl set-sink-volume "$sink" "$vol" 2>/dev/null
     pactl set-source-volume "$src" 100% 2>/dev/null

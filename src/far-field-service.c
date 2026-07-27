@@ -159,11 +159,26 @@ static int xvf_read4(uint8_t resid, uint8_t cmdid, float out[4]) {
     }
     return -1;
 }
+// AEC_SPENERGY_VALUES is INSTANTANEOUS and bursty: measured 2026-07-27 it reads
+// exactly 0.000 between spikes, so the old 450 ms poll sampled far slower than
+// the signal fires -- 1-2 detections per EIGHT SECONDS of continuous speech,
+// which made speaker tracking look broken when it was only undersampled. (The
+// threshold was never the problem: spe is bimodal, 0.000 or large.) Poll at
+// 100 ms and latch the verdict across the gaps, so the 0.45 s scene cadence
+// reports a steady talker instead of a flicker.
+#define XVF_POLL_US  100000
+#define XVF_HOLD_SEC 0.6
+static double xvf_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
 static void *xvf_main(void *arg) {
     (void)arg;
     float spe[4], azi[4];
     int fails = 0;
-    for (;; usleep(450000)) {                // the scene report cadence
+    double hold_until = 0.0;
+    for (;; usleep(XVF_POLL_US)) {
         if (xvf_read4(33, 80, spe) != 0) {   // AEC_SPENERGY_VALUES
             if (++fails >= 3) g_chip_alive = 0;
             continue;
@@ -172,19 +187,41 @@ static void *xvf_main(void *arg) {
         int best = 0;
         for (int i = 1; i < 4; i++) if (spe[i] > spe[best]) best = i;
         g_chip_spe = spe[best];
-        int talk = spe[best] > g_spe_thr;
-        if (talk && xvf_read4(33, 75, azi) == 0)             // AEC_AZIMUTH_VALUES
-            g_chip_az = azi[best] * (180.0 / M_PI);          // chip frame, raw degrees
-        g_chip_talker = talk;
+        int spike = spe[best] > g_spe_thr;
+        if (spike) {
+            if (xvf_read4(33, 75, azi) == 0)                 // AEC_AZIMUTH_VALUES
+                g_chip_az = azi[best] * (180.0 / M_PI);      // chip frame, raw degrees
+            hold_until = xvf_now() + XVF_HOLD_SEC;
+        }
+        g_chip_talker = spike || xvf_now() < hold_until;
         g_chip_alive = 1;
     }
     return NULL;
 }
+// Every firmware variant ships a DIFFERENT product id (circular C16K6Ch =
+// 0x001e, linear L16K6Ch = 0x0022, the 2ch/48k builds differ again), so the
+// old pinned-PID open silently failed the moment the linear board went in and
+// the tracker fell back to the coarse histogram -- while blaming udev. Match
+// the vendor and take the first XVF3800 that opens.
+static libusb_device_handle *xvf_open_any(void) {
+    libusb_device **list = NULL;
+    ssize_t n = libusb_get_device_list(NULL, &list);
+    libusb_device_handle *h = NULL;
+    for (ssize_t i = 0; i < n && !h; i++) {
+        struct libusb_device_descriptor d;
+        if (libusb_get_device_descriptor(list[i], &d) != 0) continue;
+        if (d.idVendor != 0x2886) continue;
+        if (libusb_open(list[i], &h) != 0) h = NULL;
+    }
+    if (list) libusb_free_device_list(list, 1);
+    return h;
+}
 static void xvf_open(void) {
     if (libusb_init(NULL) != 0) return;
-    g_xvf = libusb_open_device_with_vid_pid(NULL, 0x2886, 0x001e);
+    g_xvf = xvf_open_any();                  // by VENDOR, not a pinned product id
     if (!g_xvf) {
-        fprintf(stderr, "far-field-service: XVF3800 control unreachable (udev rule?) — histogram only\n");
+        fprintf(stderr, "far-field-service: XVF3800 control unreachable "
+                        "(no 0x2886 device, or udev) — histogram only\n");
         return;
     }
     pthread_t th;

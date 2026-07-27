@@ -15,6 +15,12 @@ grows direction-of-arrival and beam metadata, which is what the world-model
 layer upstream consumes — the likely future home of this tool is a
 `little-gemma-world-model` repo; for now it lives in tools.
 
+The array itself -- channel map, geometry, what direction-of-arrival does
+and does not mean on a linear board, and which settings here were
+inherited rather than chosen -- is documented in
+[respeaker-xvf3800.md](respeaker-xvf3800.md). Read it before trusting
+`--use-channel`, `--gain-db`, or any azimuth this service reports.
+
 ## Running it
 
 ```

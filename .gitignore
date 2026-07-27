@@ -7,8 +7,15 @@ build/
 *.pdb
 .scratch/
 .claude/
+.venv/
 __pycache__/
 # build binaries in the repo root
 /voicecat
 /clausecat
 script/__pycache__/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+# an in-source `cmake .` drops these in the repo root; the tree builds
+# out-of-source (`cmake -B build`), so a root Makefile is always generated
+/Makefile

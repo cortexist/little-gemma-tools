@@ -92,6 +92,7 @@ static const char *g_barge_note = "(interrupting) ";
 // base.en via whisper-cli, process+model load included) or passes stack up
 // and the loop falls behind real time: keep commit_ms >= 3x the pass cost.
 static int g_commit_ms = 2500, g_hang_ms = 700, g_vad = 400, g_realtime = 0;
+static int g_settle_ms = 0;  // opt-in ASR during the endpoint wait; 0 preserves scheduling
 // --max-utt SEC: force-close an utterance once its window reaches this many
 // seconds. The window is TRIMMED as whisper confirms words, so fluent speech
 // stays small (a few seconds) no matter how long you talk and NEVER hits the
@@ -1389,6 +1390,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--barge-note") && i + 1 < argc)    g_barge_note = argv[++i];
         else if (!strcmp(argv[i], "--commit-ms") && i + 1 < argc)     g_commit_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--hang-ms") && i + 1 < argc)       g_hang_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--settle-ms") && i + 1 < argc)     g_settle_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-utt") && i + 1 < argc)       g_max_utt = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--wordless-close") && i + 1 < argc) g_wordless = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--sound-tags"))                    g_sound_tags = 1;
@@ -1410,6 +1412,7 @@ int main(int argc, char **argv) {
             "                [--whisper-model FILE] [--whisper-bin PATH] [--whisper-url URL]\n"
             "                [--barge-note TEXT] [--mouth-synth CMD --mouth-play CMD]\n"
             "                [--commit-ms N=2500] [--hang-ms N=700] [--max-utt N=15] [--vad-level N=400]\n"
+            "                [--settle-ms N=0] transcribe after N ms of quiet; endpoint is unchanged\n"
             "                [--wordless-close N=2]  N consecutive whisper passes with zero words\n"
             "               close the utterance (~N x commit-ms into music/noise, vs max-utt's\n"
             "               15 s) — the ASR's own content verdict; any word resets it. 0 = off\n"
@@ -1539,6 +1542,7 @@ int main(int argc, char **argv) {
     char ptail[400] = "";                            // trimmed text tail -> whisper --prompt
     size_t last_pass = 0;                            // ub_n at the previous whisper pass
     size_t last_voice = 0;                           // ub_n at the last voiced frame
+    int settle_tried = 0;
     int in_utt = 0, onset = 0, onset_miss = 0, sil_ms = 0, turn_open = 0, barged = 0, pause_probed = 0;
     int utt_talker = 0;                              // a live talker owned this utterance at
                                                      // some point (always 1 with the gate unarmed)
@@ -1649,6 +1653,7 @@ int main(int argc, char **argv) {
                 if (ub_n + FR_SAMP > ub_cap) { ub_cap *= 2; ub = realloc(ub, ub_cap * 2); }
                 memcpy(ub + ub_n, frame, sizeof frame); ub_n += FR_SAMP;
                 sil_ms = voiced ? 0 : sil_ms + FR_MS;
+                if (voiced) settle_tried = 0;
                 if (voiced) { last_voice = ub_n; pause_probed = 0; }
                 if (talker_live()) utt_talker = 1;       // energy-independent: a clipped
                                                          // word's report can land in the
@@ -1735,6 +1740,17 @@ int main(int argc, char **argv) {
                     }
                 }
             }
+        }
+
+        // Use the endpoint wait for one tentative final pass. Capture keeps
+        // buffering upstream. Resumed speech invalidates reuse via last_voice;
+        // otherwise the existing final-pass reuse below consumes this result.
+        // Do not trim or commit here: cur must still describe the current window.
+        if (g_settle_ms > 0 && whisper && in_utt && utt_talker && !settle_tried &&
+            sil_ms >= g_settle_ms && sil_ms < g_hang_ms && last_voice > last_pass) {
+            settle_tried = 1;
+            if (whisper_pass(ub, ub_n, ptail, cur, sizeof cur, segs, &nseg) == 0)
+                last_pass = ub_n;
         }
 
         // end of the utterance: trailing silence, the source ran dry, or the

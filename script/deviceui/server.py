@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -21,6 +22,8 @@ import urllib.request
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from recording import Recording
 sys.path.insert(0, str(HERE.parent))
 from voicedemo import load_visemes, PHONEME_TO_VISEME
 
@@ -278,6 +281,7 @@ class Device:
         return {'ok': True}
 
     def work(self, profile, prompt, listen):
+        diagnostics = None
         try:
             self.directory = Path(tempfile.mkdtemp(prefix='session-', dir=self.root))
             with self.lock:
@@ -329,6 +333,25 @@ class Device:
             self.telemetry.bind(str(self.directory/'events.sock'))
             self.telemetry.settimeout(.2)
             threading.Thread(target=self.receive, daemon=True).start()
+            voice_env = os.environ.copy()
+            voice_env.pop('LG_AUDIO_DIAGNOSTICS', None)
+            if cfg.get('audio_diagnostics_dir'):
+                diagnostics = Path(cfg['audio_diagnostics_dir']).expanduser()/self.directory.name
+                diagnostics.mkdir(parents=True, mode=0o700, exist_ok=False)
+                voice_env['LG_AUDIO_DIAGNOSTICS'] = str(diagnostics)
+                manifest = dict(session=self.directory.name, profile=profile, started=time.time(),
+                                speaker_source=cfg['sink']+'.monitor', microphone_source=cfg['source'],
+                                microphone='s16le mono 16000 Hz; processed tap before listening gate',
+                                speaker='s16le stereo 16000 Hz',
+                                timing='microphone-clock.tsv: wall-clock receive time, sample offset, sample count; not ADC timestamps',
+                                voicecat=cfg['voicecat'])
+                (diagnostics/'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+                with (diagnostics/'speaker.s16le').open('wb') as output:
+                    self.spawn('speaker-capture', ['parec', '--record', '--raw',
+                               '--device='+cfg['sink']+'.monitor', '--format=s16le', '--rate=16000',
+                               '--channels=2', '--channel-map=front-left,front-right',
+                               '--latency-msec=20', '--process-time-msec=10'], stdout=output)
+                self.emit('audio_capture', str(diagnostics))
             tap = self.spawn('mic', [cfg['far_field'], '--tap', ff_sock, '--mux'], stdout=subprocess.PIPE)
             synth = shlex.join(self.synthesis_command())
             play = shlex.join([cfg['far_field'], '--speak', ff_sock, '--rate', str(cfg.get('sample_rate', 22050))])
@@ -338,7 +361,7 @@ class Device:
                     '--mood-route', '--duck-sock', ff_sock, '--whisper-url', cfg['whisper_url'],
                     '--mouth-synth', synth, '--mouth-play', play, '--monitor-sock', str(self.directory/'events.sock'),
                     '--control-sock', str(self.directory/'control.sock'), '--start-muted']
-            self.spawn('voice', args, stdin=tap.stdout)
+            self.spawn('voice', args, stdin=tap.stdout, env=voice_env)
             tap.stdout.close()
             deadline = time.time()+60
             while not (self.directory/'control.sock').is_socket() or not self.state.get('piper_config'):
@@ -379,6 +402,10 @@ class Device:
                 if not self.state['error']:
                     self.state['phase'] = 'stopped'
             self.emit('stopped')
+            if diagnostics:
+                for name in ('events.jsonl', 'voice.log', 'audio.log', 'speaker-capture.log', 'system.txt'):
+                    source = self.directory/name
+                    if source.exists(): shutil.copy2(source, diagnostics/name)
 
     def receive(self):
         stream = self.telemetry
@@ -487,6 +514,16 @@ def create_app(config):
         with urllib.request.urlopen(req, timeout=25 if action == 'stop' else 5) as response:
             return json.load(response)
 
+    def recording_models():
+        # The coordinator supplies its ready states before enabling speech.
+        if session['active'] and session['phase'] == 'loading': return None
+        states = [device.snapshot()['state']]
+        if not states[0]['ready']: return None
+        if config.get('peer'): states.append(call('peer', 'status')['state'])
+        return [s['profile'] for s in states] if all(s['ready'] for s in states) else None
+
+    recording = Recording(config, recording_models, lambda: device.capture_source()['name'])
+
     def conversation(data):
         def status(side):
             return call(side, 'status', {'after': 9223372036854775807})['state']
@@ -507,6 +544,8 @@ def create_app(config):
                 if all(st['ready'] for st in states.values()): break
                 if any(st['error'] for st in states.values()): raise RuntimeError(str(states))
                 if time.time()>deadline: raise RuntimeError('devices did not become ready')
+            if session_stop.is_set() or expired(): return
+            recording.models_ready([states[side]['profile'] for side in ['local', 'peer']])
             if session_stop.is_set() or expired(): return
             for side in ['local', 'peer']:
                 call(side, 'listen', {'enabled': True})
@@ -552,6 +591,7 @@ def create_app(config):
         except Exception as exc:
             session['error'] = str(exc)
         finally:
+            recording.stop(wait=True)
             for side in ['local', 'peer']:
                 try: call(side, 'stop')
                 except Exception as exc: session['error'] += ' '+str(exc)
@@ -581,6 +621,15 @@ def create_app(config):
         except Exception as exc:
             return jsonify(error=str(exc)), 400
 
+    @app.route('/api/recording', methods=['GET', 'POST', 'DELETE'])
+    def recording_api():
+        try:
+            if request.method == 'POST': return jsonify(recording.arm())
+            if request.method == 'DELETE': return jsonify(recording.stop())
+            return jsonify(recording.snapshot())
+        except Exception as exc:
+            return jsonify(error=str(exc)), 400
+
     @app.route('/api/conversation', methods=['GET', 'POST', 'DELETE'])
     def conversation_api():
         with session_lock:
@@ -600,16 +649,18 @@ def create_app(config):
                 session_thread[0].start()
             elif request.method == 'DELETE':
                 session_stop.set()
-            return jsonify(session)
+            return jsonify(**session, recording=recording.snapshot())
 
     def shutdown():
         session_stop.set()
+        recording.stop(wait=True)
         if session_thread[0] and session_thread[0].is_alive():
             session_thread[0].join(timeout=60)
         device.stop()
 
     app.shutdown = shutdown
     app.device = device
+    app.recording = recording
     app.session_stop = session_stop
     return app
 

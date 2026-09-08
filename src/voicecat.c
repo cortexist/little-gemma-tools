@@ -533,12 +533,44 @@ static void whisper_vtt(char *raw, char *out, size_t cap, struct wseg *segs, int
     }
     if (seg_open && *nseg < WSEG_MAX) { segs[*nseg].end_samp = pend; segs[*nseg].words = words; (*nseg)++; }
 }
+// Opt-in research capture. The dashboard creates a private, per-session directory.
+static FILE *diagnostic_file(const char *name) {
+    const char *dir = getenv("LG_AUDIO_DIAGNOSTICS");
+    if (!dir || !*dir) return NULL;
+    char path[2048];
+    int n = snprintf(path, sizeof path, "%s/%s", dir, name);
+    FILE *f = n > 0 && n < (int)sizeof path ? fopen(path, "wb") : NULL;
+    if (!f) { fprintf(stderr, "voicecat: diagnostic capture open failed\n"); exit(1); }
+    return f;
+}
+
 static int whisper_pass(const int16_t *pcm, size_t nsamp, const char *prompt,
                         char *out, size_t cap, struct wseg *segs, int *nseg) {
+    char timing[96];
+    double started = now_sec();
+    snprintf(timing, sizeof timing, "audio_s=%.3f", (double)nsamp / LG_RATE);
+    monitor_event("asr_start", timing);
     if (cap) out[0] = 0;
     *nseg = 0;
     char wav[1024]; temp_wav_path(wav, sizeof wav);
     if (write_wav(wav, pcm, nsamp) != 0) { fprintf(stderr, "voicecat: temp wav write failed (%s)\n", wav); return -1; }
+    static unsigned pass = 0;
+    char capture[80];
+    snprintf(capture, sizeof capture, "asr-%06u.wav", ++pass);
+    FILE *copy = diagnostic_file(capture);
+    if (copy) {
+        FILE *input = fopen(wav, "rb");
+        char buf[8192]; size_t count;
+        if (!input) exit(1);
+        while ((count = fread(buf, 1, sizeof buf, input)))
+            if (fwrite(buf, 1, count, copy) != count) exit(1);
+        fclose(input);
+        if (fclose(copy)) exit(1);
+        monitor_event("asr_capture", capture);
+        snprintf(capture, sizeof capture, "asr-%06u-prompt.txt", pass);
+        copy = diagnostic_file(capture);
+        fputs(prompt ? prompt : "", copy); fclose(copy);
+    }
     const char *bin = g_whisper_bin ? g_whisper_bin : "whisper-cli";
     char parg[512] = "";
     if (prompt && *prompt) {
@@ -573,6 +605,9 @@ static int whisper_pass(const int16_t *pcm, size_t nsamp, const char *prompt,
     char raw[16384]; size_t n = fread(raw, 1, sizeof raw - 1, f); raw[n] = 0;
     int rc = pclose(f);
     remove(wav);
+    snprintf(capture, sizeof capture, "asr-%06u-response.txt", pass);
+    copy = diagnostic_file(capture);
+    if (copy) { fwrite(raw, 1, n, copy); fclose(copy); }
     if (n == 0 && rc != 0) { fprintf(stderr, "voicecat: whisper failed (rc %d) — is it on PATH?\n", rc); return -1; }
 
     if (g_whisper_url)
@@ -603,6 +638,8 @@ static int whisper_pass(const int16_t *pcm, size_t nsamp, const char *prompt,
         for (size_t i = 0; out[i]; i++) words += out[i] == ' ';
         segs[0].end_samp = nsamp; segs[0].words = words; *nseg = 1;
     }
+    snprintf(timing, sizeof timing, "elapsed_s=%.6f text_bytes=%zu", now_sec() - started, w);
+    monitor_event("asr_done", timing);
     return 0;
 }
 
@@ -1642,6 +1679,7 @@ int main(int argc, char **argv) {
     int utt_talker = 0;                              // a live talker owned this utterance at
                                                      // some point (always 1 with the gate unarmed)
     int wordless = 0;                                // consecutive mid-passes with zero words
+    int endpoint_waiting = 0;                        // diagnostic transition, not an endpoint rule
     int duck_pending = 0;                            // a stage-1 duck awaiting words
     int pending = 0, barge_armed = 1;    // replies awaited; one barge per utterance
     struct turn_state tstate = {0};
@@ -1651,9 +1689,18 @@ int main(int argc, char **argv) {
     double last_activity = now_sec();                // the idle clock (--idle-compress)
     int dirty = 0;                                   // turns exchanged since the last compress
 
+    FILE *diagnostic_pcm = diagnostic_file("microphone.s16le");
+    FILE *diagnostic_clock = diagnostic_file("microphone-clock.tsv");
+    size_t diagnostic_samples = 0;
     fprintf(stderr, "voicecat: %s, listening\n", whisper ? "streaming transcripts" : "native audio spans");
     for (;;) {
         size_t got = g_stdin_mux ? mux_tick(src, frame) : fread(frame, 2, FR_SAMP, src);
+        if (diagnostic_pcm && got) {
+            if (fwrite(frame, 2, got, diagnostic_pcm) != got || fflush(diagnostic_pcm)) exit(1);
+            fprintf(diagnostic_clock, "%.6f\t%zu\t%zu\n", now_sec(), diagnostic_samples, got);
+            if (fflush(diagnostic_clock)) exit(1);
+            diagnostic_samples += got;
+        }
         int eof = got < FR_SAMP;
 #ifndef _WIN32
         char command[4096]; int nc;
@@ -1764,6 +1811,7 @@ int main(int argc, char **argv) {
                     memcpy(ub, ring + (PREROLL - ring_n) * FR_SAMP, pre * 2);
                     ub_n = pre;
                     in_utt = 1; sil_ms = 0; onset = 0; onset_miss = 0; pause_probed = 0;
+                    monitor_event("ear_begin", "");
                     committed = 0; trimmed = 0; ptail[0] = 0;
                     prev[0] = 0; last_pass = 0; last_voice = ub_n; turn_open = 0;
                     wordless = 0; g_utt_tags[0] = 0;
@@ -1773,7 +1821,15 @@ int main(int argc, char **argv) {
             } else {
                 if (ub_n + FR_SAMP > ub_cap) { ub_cap *= 2; ub = realloc(ub, ub_cap * 2); }
                 memcpy(ub + ub_n, frame, sizeof frame); ub_n += FR_SAMP;
+                if (voiced && sil_ms >= 300) monitor_event("ear_resume", "");
+                int previous_silence = sil_ms;
                 sil_ms = voiced ? 0 : sil_ms + FR_MS;
+                if ((previous_silence < 300 && sil_ms >= 300) ||
+                    (previous_silence < g_hang_ms && sil_ms >= g_hang_ms)) {
+                    char detail[80];
+                    snprintf(detail, sizeof detail, "silence_ms=%d buffered_s=%.3f", sil_ms, (double)ub_n / LG_RATE);
+                    monitor_event("ear_quiet", detail);
+                }
                 if (voiced) settle_tried = 0;
                 if (voiced) { last_voice = ub_n; pause_probed = 0; }
                 if (talker_live()) utt_talker = 1;       // energy-independent: a clipped
@@ -1882,8 +1938,12 @@ int main(int argc, char **argv) {
         // on non-speech, so it can't cut a real utterance mid-word.
         int max_utt_hit = g_max_utt > 0 && ub_n >= (size_t)g_max_utt * LG_RATE;
         int wordless_hit = g_wordless > 0 && wordless >= g_wordless;
+        int waiting = in_utt && sil_ms >= g_hang_ms && now_sec() < g_endpoint_hold_until;
+        if (waiting != endpoint_waiting) monitor_event("endpoint_wait", waiting ? "1" : "0");
+        endpoint_waiting = waiting;
         if (in_utt && ((sil_ms >= g_hang_ms && now_sec() >= g_endpoint_hold_until) ||
                        eof || max_utt_hit || wordless_hit)) {
+            monitor_event("ear_end", max_utt_hit ? "limit" : wordless_hit ? "wordless" : eof ? "eof" : "silence");
             in_utt = 0;
             if (max_utt_hit)
                 fprintf(stderr, "voicecat: max-utt cap (%.0fs unconfirmed audio) — closing\n",

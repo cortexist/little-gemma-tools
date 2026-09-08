@@ -33,7 +33,7 @@ class Panel {
     this.q("prompt").value =
       common +
       (role.toLowerCase() === "teacher"
-        ? "You are the teacher. While the conversation is continuing, explain the topic accurately, then ask your student one clear question. Encourage useful corrections."
+        ? "You are the teacher. While the conversation is continuing, explain the topic accurately, then ask your student one clear question. Encourage useful corrections. Your input comes from speech recognition and may contain errors. Use the conversation topic to interpret likely sound-alike words. Treat incidental transcription annotations such as [Music], (gentle music), and [BLANK_AUDIO] as non-speech; do not comment on them or invent an event from them. When the intended meaning is clear, respond naturally without criticizing the wording. When ambiguity affects the answer, ask a brief clarification instead of assuming the student is wrong. Do not invent an answer for a missing or unintelligible reply."
         : "You are the student. While the conversation is continuing, answer your teacher’s question, then ask one brief follow-up question about the topic. Admit uncertainty.") + briefFirst;
     this.mouth("b_m_p");
     this.q("volume").oninput = () =>
@@ -349,6 +349,34 @@ function sessionBusy() {
   if (busy) $("session-state").textContent = sessionPending;
 }
 let sessionActive = false, sessionLoading = false;
+let recordingState = { available: false, phase: "idle" }, recordingPending = false;
+let recordingError = "", recordingMutation = 0;
+function showRecording() {
+  const r = recordingState, button = $("record"), status = $("recording-state");
+  button.hidden = !r.available;
+  button.disabled = recordingPending || r.phase === "stopping";
+  button.textContent = ({ armed: "Cancel recording", starting: "Cancel recording",
+    recording: "Stop recording", stopping: "Saving recording…" })[r.phase] || "Record";
+  button.setAttribute("aria-pressed", String(["armed", "starting", "recording", "stopping"].includes(r.phase)));
+  button.classList.toggle("recording", r.phase === "recording");
+  status.hidden = !r.available || (!recordingPending && r.phase === "idle" && !r.file);
+  status.classList.toggle("busy", recordingPending || ["armed", "starting", "stopping"].includes(r.phase));
+  status.textContent = recordingPending ? "Updating recording…" :
+    r.phase === "armed" ? "Armed · waiting for models to load" :
+    r.phase === "starting" ? "Starting recording…" :
+    r.phase === "recording" ? "Recording · " + r.file :
+    r.phase === "stopping" ? "Saving recording…" :
+    r.phase === "error" ? "Recording failed" : r.file ? "Saved · " + r.file : "";
+  $("recording-error").textContent = recordingError || r.error || "";
+}
+$("record").onclick = async () => {
+  if (recordingPending) return;
+  const stop = ["armed", "starting", "recording"].includes(recordingState.phase);
+  recordingPending = true; recordingError = ""; recordingMutation++; showRecording();
+  try { recordingState = await api("recording", stop ? undefined : {}, stop ? "DELETE" : "POST"); }
+  catch (e) { recordingError = e.message; }
+  finally { recordingPending = false; recordingMutation++; showRecording(); }
+};
 panels.local = new Panel("local", config.role || "teacher");
 if (config.peer) panels.peer = new Panel("peer", "Student");
 $("begin").onclick = async () => {
@@ -373,6 +401,7 @@ $("end").onclick = async () => {
   sessionPending = "Stopping both devices…"; sessionBusy();
   try {
     await api("conversation", undefined, "DELETE");
+    recordingState = await api("recording", undefined, "DELETE"); showRecording();
     await Promise.all(
       Object.keys(panels).map((side) => api(side + "/stop", {})),
     );
@@ -384,7 +413,11 @@ $("end").onclick = async () => {
 };
 async function sessionPoll() {
   try {
+    const recordingVersion = recordingMutation;
     const s = await api("conversation");
+    if (!recordingPending && recordingVersion === recordingMutation && s.recording) {
+      recordingState = s.recording; showRecording();
+    }
     sessionActive = s.active;
     sessionLoading = s.phase === "loading";
     $("session-state").textContent = s.phase;

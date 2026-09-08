@@ -403,3 +403,6 @@ footer {
 
 .icon-button:not([aria-pressed="true"]) { background: #e2ebd7; }
 .icon-button[aria-pressed="true"] { background: transparent; }
+
+#record.recording { background: #a72c38; color: white; }
+#recording-state { overflow-wrap: anywhere; font-size: .9rem; }

@@ -43,6 +43,54 @@ A turn limit waits for the final synthesis-complete marker and estimated queued 
 
 The 48-input-turn cap is a conservative demo policy, not a measured context-window capacity. At the cap, final playback drains and both pipelines stop. There is no automatic reload, history summary or continuation seed. Longer conversation history management is deferred; initial model loading is excluded from the session timer.
 
+## Screen recording
+
+When `wf-recorder` is installed and the dashboard server runs in a Wayland
+desktop session, **Record** appears beside the conversation controls. On Sway,
+keep the Voice classroom window visible and click Record to arm it, then start
+the conversation. Capture begins after both pipelines are ready, before the
+teacher's opening. If both models are already loaded, capture starts immediately.
+Click again to cancel while armed or stop while recording. The saving spinner
+remains until the recorder has finalized the MP4. Session completion and server
+shutdown also stop recording.
+
+Videos are saved on the dashboard host in `~/Videos/screen_recordings`, named
+from the actual loaded profile IDs and recording-start time, for example
+`voice-classroom-12b-e2b-20260908-1646.mp4`. Repeated recordings in the same
+minute get `-2`, `-3`, etc., without overwriting earlier files.
+
+Capture uses the classroom window's screen rectangle at recording start;
+keep it visible and in place during recording. Set `recording_audio_source`
+to an existing source such as `voice_classroom_mix.monitor` to record a prepared
+digital mix directly. The recorder leaves that mix and its relay processes
+running on stop, and reports an error if the configured source is missing.
+It does not silently switch to microphone recording.
+
+To feed the local speaker into that mix with a fresh native loopback for each
+recording, set `recording_local_relay` to
+`{"sink": "voice_classroom_mix", "volume": 58982}`. Volume is a raw PulseAudio
+value (65536 is unity). Stop any existing local relay first to avoid duplicate
+audio. The recorder creates this loopback after model readiness, requests 20 ms
+latency, and removes only its own loopback when recording ends. Existing remote
+feeds remain in place. This avoids carrying a long-running shell relay's queued
+audio into a new video; it does not change live lip-sync or speaker volume.
+
+Without that setting, audio combines the configured
+speaker monitor with processed microphone channel 0 through an isolated
+PulseAudio/PipeWire mix, including both the local voice and the other device
+heard through the microphone. Hardware mute controls remain effective.
+This temporary mix is removed on stop; no browser microphone or screen-sharing permission
+is used. This records the server's desktop, even when the controls are opened
+on another computer.
+
+The server needs its desktop's `WAYLAND_DISPLAY`, `SWAYSOCK` and
+`XDG_RUNTIME_DIR`, plus `swaymsg`, `pactl` and wf-recorder with H.264/AAC support.
+Optional private config keys are `recording_directory` (default above) and
+`recording_target` (`window`, or `display` for the output containing the
+classroom window). Automatic window selection currently uses Sway IPC.
+Recorder errors are shown in the UI; diagnostic output is in
+`runtime_dir/recording.log`. Arming alone creates no recording or audio stream.
+
 ## Metadata and synchronization
 
 Expressions automatically return to neutral after the reply finishes synthesis and estimated queued playback drains; a generation-complete event alone does not end the expression. An explicit neutral expression can replace it earlier. Nod and shake run three 650 ms animation cycles (1.95 seconds) then return to quiet. Repeated gesture events restart the sequence; quiet cancels it. Stop and cut clear both. These dashboard defaults do not require model-generated closing tags. Gesture timing starts at metadata receipt, not phoneme-aligned placement within the spoken turn.

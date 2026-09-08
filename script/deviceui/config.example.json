@@ -1,0 +1,51 @@
+{
+  "name": "Teacher device",
+  "role": "teacher",
+  "key": "replace-with-a-random-device-key",
+  "runtime_dir": "/tmp/voice-ui",
+  "engine": "/path/to/little-gemma/build/run-cuda-i8",
+  "voicecat": "/path/to/little-gemma-tools/build/voicecat",
+  "far_field": "/path/to/little-gemma-tools/build/far-field-service",
+  "ff_socket": "/tmp/ff.sock",
+  "source": "exact-pactl-source-name",
+  "sink": "exact-pactl-sink-name",
+  "channels": 6,
+  "sample_rate": 22050,
+  "sync_offset_ms": 100,
+  "profiles": {
+    "12b": {
+      "label": "12B",
+      "model": "/path/to/12B.gguf",
+      "head": "/path/to/12B-mtp.gguf",
+      "env": {
+        "LG_MTP_N": "3"
+      }
+    }
+  },
+  "piper": [
+    "/path/to/piper/.venv/bin/python",
+    "-m",
+    "piper"
+  ],
+  "voice": "/path/to/voice.onnx",
+  "whisper_model": "/path/to/ggml-base.en.bin",
+  "whisper_url": "http://127.0.0.1:18643/inference",
+  "whisper_health": "http://127.0.0.1:18643/",
+  "whisper_command": [
+    "/path/to/whisper-server",
+    "-m",
+    "/path/to/ggml-base.en.bin",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18643"
+  ],
+  "peer": {
+    "url": "http://student-device:8095",
+    "key": "the-student-device-key"
+  },
+  "capture_controls": [
+    "Headset,0",
+    "Headset,1"
+  ]
+}

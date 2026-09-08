@@ -7,6 +7,12 @@ coupling is the wire protocol in `proto/lg_media_proto.h`, a self-contained copy
 little-gemma's media frame format — a one-way dependency (tools → the protocol),
 never the reverse.
 
+## OpenAI-style chat API
+
+A separate Flask adapter exposes a dedicated little-gemma UNIX socket through
+`/v1/models` and `/v1/chat/completions`, with text history and SSE streaming.
+See [setup, client examples and compatibility limits](docs/openai-api.md).
+
 ## mmcat — multimodal cat
 
 The successor to little-gemma's bundled `media_cat`. Where `media_cat` needs a
@@ -380,3 +386,10 @@ them with `--whisper-model` / `--whisper-bin` or `LG_WHISPER_MODEL` /
 
 ## License
 MIT (see `LICENSE`), matching little-gemma.
+
+### Device voice dashboard
+
+For physical microphones/speakers, model status, volume controls, lip sync,
+expressions/gestures, and a two-device teacher–student conversation, see the
+[device voice UI guide](docs/device-voice-ui.md). The browser monitors the devices;
+it does not use its own microphone or speaker.

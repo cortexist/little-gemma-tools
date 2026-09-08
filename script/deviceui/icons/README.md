@@ -1,0 +1,1 @@
+Fluent UI System Icons by Microsoft, MIT licensed (see LICENSE). Downloaded from https://api.iconify.design/fluent/ . SVGs are served locally; browsers do not contact Iconify. The 24px speaker-2 icon is named speaker-2-24-regular.

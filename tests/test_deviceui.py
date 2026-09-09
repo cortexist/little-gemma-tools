@@ -24,6 +24,17 @@ class DeviceTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_question_boundary_is_opt_in_and_keeps_selected_model(self):
+        cfg = dict(engine='/engine', end_on_question=True)
+        selected = dict(model='/12b.gguf', head='/mtp.gguf')
+        expected = ['/engine', '-m', '/12b.gguf', '-sys', '/system', '-s', '/socket',
+                    '-mtp', '/mtp.gguf']
+        self.assertEqual(module.engine_command(cfg, selected, '/system', '/socket'),
+                         expected + ['-end-on-question'])
+        cfg.pop('end_on_question')
+        self.assertEqual(module.engine_command(cfg, selected, '/system', '/socket'), expected)
+        self.assertNotIn('-mtp', module.engine_command(cfg, dict(model='/e4b.gguf'), '/system', '/socket'))
+
     def test_control_requires_key_and_same_origin(self):
         self.assertEqual(self.client.post('/api/local/volume', json={'percent':82}).status_code, 403)
         self.assertEqual(self.client.post('/api/local/volume', json={'percent':82},

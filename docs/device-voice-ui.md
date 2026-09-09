@@ -167,3 +167,14 @@ metadata, change speech, or drive a hardware actuator.
 The private `vad_level` setting controls voicecat’s RMS speech threshold (default
 200). Higher values can prevent background sound from resetting endpoint silence,
 but can also miss quiet speech; validate it with the actual microphone setup.
+
+### Teacher question boundary
+
+A node configured with `"end_on_question": true` launches the engine with
+`-end-on-question` (requires an engine build that supports that option). This
+ends the spoken answer after its first question and waits for a real reply; it
+also prevents a second answer channel from being generated in the same turn.
+The teacher prompt explicitly asks the model to wait. The option is off by
+default, preserves the selected model and MTP settings, and also stops at quoted
+or rhetorical questions. Use it for the classroom's one-question-per-turn role,
+not for unrestricted long-form responses.

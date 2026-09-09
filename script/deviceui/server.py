@@ -54,6 +54,16 @@ def stop_tree(proc):
         proc.wait()
 
 
+def engine_command(cfg, selected, system_file, socket_path):
+    """Build the node's engine invocation; classroom turn policy is opt-in."""
+    argv = [cfg['engine'], '-m', selected['model'], '-sys', str(system_file), '-s', socket_path]
+    if selected.get('head'):
+        argv += ['-mtp', selected['head']]
+    if cfg.get('end_on_question', False):
+        argv += ['-end-on-question']
+    return argv
+
+
 class Device:
     def __init__(self, config):
         self.cfg = config
@@ -307,9 +317,7 @@ class Device:
                 raise ValueError('configured existing audio service socket is missing')
             env = {k: v for k, v in os.environ.items() if not k.startswith('LG_')}
             env.update(selected.get('env', {}))
-            engine = [cfg['engine'], '-m', selected['model'], '-sys', str(self.directory/'system.txt'), '-s', lg_sock]
-            if selected.get('head'):
-                engine += ['-mtp', selected['head']]
+            engine = engine_command(cfg, selected, self.directory/'system.txt', lg_sock)
             self.spawn('engine', engine, env=env)
             if cfg.get('whisper_command'):
                 self.spawn('whisper', cfg['whisper_command'])

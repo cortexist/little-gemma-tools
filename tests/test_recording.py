@@ -112,6 +112,28 @@ class RecordingTests(unittest.TestCase):
             microphone.assert_not_called()
             self.assertEqual(modules, [])
 
+    def test_prepares_remote_feed_before_borrowing_mix(self):
+        self.rec.cfg.update(recording_audio_source='classroom.monitor',
+                            recording_prepare_command=['relay', '--refresh'])
+        order = []
+        with patch.object(m.subprocess, 'run', side_effect=lambda *a, **k: order.append('prepare')) as run, \
+             patch.object(m, 'command', side_effect=lambda *a: order.append('source') or '[{"name":"classroom.monitor"}]'):
+            self.assertEqual(self.rec.audio_source([]), 'classroom.monitor')
+        self.assertEqual(order, ['prepare', 'source'])
+        self.assertEqual(run.call_args.args[0], ['relay', '--refresh'])
+        self.assertEqual(run.call_args.kwargs['timeout'], 15)
+
+    def test_failed_remote_preparation_prevents_capture(self):
+        self.rec.cfg['recording_prepare_command'] = ['relay', '--refresh']
+        with patch.object(m, 'classroom_geometry', return_value='0,0 100x100'), \
+             patch.object(m.subprocess, 'run', side_effect=m.subprocess.CalledProcessError(1, 'relay', stderr='no PCM')), \
+             patch.object(m.subprocess, 'Popen') as spawn:
+            self.rec.prepared_models = ['12b', 'e4b']
+            self.rec.work()
+            self.assertIn('Recording audio preparation failed: no PCM', self.rec.snapshot()['error'])
+            spawn.assert_not_called()
+            self.assertFalse(list(self.root.glob('*.mp4')))
+
     def test_missing_configured_mix_does_not_silently_switch_to_room_audio(self):
         self.rec.cfg['recording_audio_source'] = 'missing.monitor'
         with patch.object(m, 'command', return_value='[]') as command:

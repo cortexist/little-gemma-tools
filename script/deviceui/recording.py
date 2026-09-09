@@ -97,6 +97,16 @@ class Recording:
         raise ValueError('Too many recordings with the same name')
 
     def audio_source(self, modules):
+        prepare = self.cfg.get('recording_prepare_command')
+        if prepare:
+            if not isinstance(prepare, list) or not all(isinstance(arg, str) for arg in prepare):
+                raise ValueError('recording_prepare_command must be an argument list')
+            try:
+                subprocess.run(prepare, check=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, timeout=15)
+            except (subprocess.SubprocessError, OSError) as exc:
+                detail = getattr(exc, 'stderr', '') or str(exc)
+                raise RuntimeError('Recording audio preparation failed: '+detail.strip()) from exc
         source = self.cfg.get('recording_audio_source')
         if source:
             sources = json.loads(command(['pactl', '-f', 'json', 'list', 'sources']))

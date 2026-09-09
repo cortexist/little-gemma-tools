@@ -146,3 +146,24 @@ Streaming Piper audio is not peak-normalized because playback begins before the
 whole sentence exists. Configure measured corrections in `voice_gains_db`, keyed
 by the exact voice model path. The correction is passed to Piper's streaming
 volume control, is limited to ±12 dB, and does not add sentence buffering.
+
+## Experimental automatic gestures
+
+The **Automatic speech gestures** checkbox in device details enables one fallback
+shake per turn, by default on the student only. Explicit model gestures
+suppress the fallback. Only negative cues such as “no”, “not” and negative contractions trigger a shake.
+Affirmative words never generate automatic nods. Questions, quoted speech, conditional clauses, mixed
+yes/no and “not only” are skipped conservatively.
+
+The UI locates negative words in Piper's phoneme groups, including fused forms
+such as “I am”. It falls back to word positions only when group counts match,
+and skips ambiguous matches. A gesture starts at the cue word's phoneme time on the same
+estimated playback clock and visual offset as lipsync. It performs one 325 ms
+motion; explicit gestures retain their existing animation. Cuts, stops and
+turn changes invalidate pending fallback cues. Automatic actions appear as
+`auto_gesture` in browser live metadata; they do not become model-generated
+metadata, change speech, or drive a hardware actuator.
+
+The private `vad_level` setting controls voicecat’s RMS speech threshold (default
+200). Higher values can prevent background sound from resetting endpoint silence,
+but can also miss quiet speech; validate it with the actual microphone setup.

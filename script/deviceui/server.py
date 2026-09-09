@@ -355,7 +355,7 @@ class Device:
             tap = self.spawn('mic', [cfg['far_field'], '--tap', ff_sock, '--mux'], stdout=subprocess.PIPE)
             synth = shlex.join(self.synthesis_command())
             play = shlex.join([cfg['far_field'], '--speak', ff_sock, '--rate', str(cfg.get('sample_rate', 22050))])
-            args = [cfg['voicecat'], lg_sock, '--stdin-mux', '--vad-level', '200', '--hang-ms', '500',
+            args = [cfg['voicecat'], lg_sock, '--stdin-mux', '--vad-level', str(cfg.get('vad_level', 200)), '--hang-ms', '500',
                     '--commit-ms', '1100', '--settle-ms', '300', '--clock', '0', '--idle-compress', '0',
                     '--barge-mult', '7', '--barge-onset', '9', '--barge-hang', '7', '--hush-tail', '--sound-tags',
                     '--mood-route', '--duck-sock', ff_sock, '--whisper-url', cfg['whisper_url'],

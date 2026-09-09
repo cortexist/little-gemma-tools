@@ -24,12 +24,22 @@ class Panel {
     this.timers = [];
     this.schedules = [];
     this.segments = [];
+    this.clauses = [];
+    this.gestureTurn = 0;
+    this.explicitGesture = false;
+    this.autoGestureUsed = false;
+    this.autoGestureUntil = 0;
     this.lines = [];
     this.ready = false;
     this.el = $("device-template").content.firstElementChild.cloneNode(true);
     $("devices").append(this.el);
     this.q = (cls) => this.el.querySelector("." + cls);
     this.q("role").textContent = role.toUpperCase();
+    this.q("auto-gestures").checked = role.toLowerCase() === "student";
+    this.q("auto-gestures").onchange = () => {
+      this.autoGestureUntil = 0;
+      this.q("portrait").classList.remove("auto-nod", "auto-shake");
+    };
     this.q("prompt").value =
       common +
       (role.toLowerCase() === "teacher"
@@ -117,6 +127,12 @@ class Panel {
     this.timers = [];
     this.schedules = [];
     this.segments = [];
+    this.clauses = [];
+    this.gestureTurn++;
+    this.explicitGesture = false;
+    this.autoGestureUsed = false;
+    this.autoGestureUntil = 0;
+    this.q("portrait").classList.remove("auto-nod", "auto-shake");
     this.mouth("b_m_p");
     this.q("phoneme").textContent = "—";
   }
@@ -142,6 +158,28 @@ class Panel {
         ((schedule.offset - segment.offset) * 500) / segment.rate +
         +this.q("offset").value;
       let end = base;
+      const cue = speechGesture(schedule.text || "", schedule.rows);
+      if (cue && base + cue.start >= Date.now()) {
+        const turn = schedule.turn;
+        this.timers.push(setTimeout(() => {
+          if (turn !== this.gestureTurn || this.explicitGesture || this.autoGestureUsed ||
+              !this.q("auto-gestures").checked) return;
+          this.autoGestureUsed = true;
+          this.autoGestureUntil = Date.now() + 325;
+          const face = this.q("portrait");
+          face.classList.remove("nod", "shake", "auto-nod", "auto-shake");
+          face.style.animationDelay = "0s";
+          void face.offsetWidth;
+          face.classList.add("auto-" + cue.kind);
+          this.q("gesture").textContent = cue.kind + " (automatic)";
+          this.event({ kind: "auto_gesture", text: cue.kind + " on “" + cue.word + "”",
+            at: Date.now() / 1000 });
+          this.timers.push(setTimeout(() => {
+            face.classList.remove("auto-nod", "auto-shake");
+            this.autoGestureUntil = 0;
+          }, 325));
+        }, base + cue.start - Date.now()));
+      }
       for (const row of schedule.rows) {
         const [start, dur, ph] = row.split("\t");
         if (ph === undefined) continue;
@@ -171,10 +209,23 @@ class Panel {
   event(e) {
     if (e.kind === "reset" || e.kind === "cut" || e.kind === "stopped")
       this.clear();
+    if (e.kind === "input_done") {
+      this.gestureTurn++;
+      this.explicitGesture = false;
+      this.autoGestureUsed = false;
+      this.clauses = [];
+    }
+    if (e.kind === "gesture" && ["nod", "shake"].includes(e.text)) {
+      this.explicitGesture = true;
+      this.autoGestureUntil = 0;
+      this.q("portrait").classList.remove("auto-nod", "auto-shake");
+    }
+    if (e.kind === "clause") this.clauses.push(e.text);
     if (e.kind === "alignment") {
       const lines = e.text.split("\n");
       const [offset, rate] = lines.shift().split("\t");
-      this.schedules.push({ offset: +offset, rate: +rate, rows: lines });
+      this.schedules.push({ offset: +offset, rate: +rate, rows: lines,
+        text: this.clauses.shift() || "", turn: this.gestureTurn });
       this.align();
     }
     if (e.kind === "play") {
@@ -186,6 +237,7 @@ class Panel {
       [
         "expression",
         "gesture",
+        "auto_gesture",
         "clause",
         "input_done",
         "error",
@@ -271,7 +323,7 @@ class Panel {
         "No reply yet.";
       this.q("expression").textContent = s.expression;
       this.q("portrait").dataset.mood = s.expression;
-      this.q("gesture").textContent = s.gesture;
+      if (Date.now() >= this.autoGestureUntil) this.q("gesture").textContent = s.gesture;
       const face = this.q("portrait");
       const gestureKey = s.gesture + ":" + (s.gesture_until || 0);
       if (gestureKey !== this.gestureKey) {

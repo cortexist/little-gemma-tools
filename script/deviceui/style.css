@@ -315,6 +315,12 @@ footer {
 .portrait.shake {
   animation: shake 0.325s 3;
 }
+.portrait.auto-nod {
+  animation: nod 0.325s 1;
+}
+.portrait.auto-shake {
+  animation: shake 0.325s 1;
+}
 @keyframes nod {
   30% {
     transform: perspective(450px) rotateX(-24deg) rotateY(0deg);

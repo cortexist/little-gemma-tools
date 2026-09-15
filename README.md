@@ -289,6 +289,12 @@ can start speaking at the first comma instead of the first newline. The model's
 own punctuation is the split policy; the runner repo's `docs/voice-sys.txt` is
 what makes it appear within the first few words.
 
+Personal titles (`Mr.`, `Mrs.`, `Ms.`, `Dr.`, `Prof.`, `Rev.`) stay with the
+following name. The TTS copy removes or expands their abbreviation periods so
+eSpeak does not create another sentence break: `Mrs. Byers` is sent as
+`Mrs Byers`. Voicecat and the browser demo preserve original transcript text.
+Ordinary punctuation still flushes immediately; this adds no buffering timer.
+
 ```
 voicecat /tmp/lg.sock … | clausecat | piper -m voice.onnx --output-raw --stream     | aplay -r 22050 -f S16_LE -t raw -c 1 -
 ```

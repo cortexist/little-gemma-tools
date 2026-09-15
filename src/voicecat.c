@@ -43,6 +43,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "speech_titles.h"
 #include <stdint.h>
 #include <math.h>
 #include <ctype.h>
@@ -847,8 +848,10 @@ static void m_flush_line(void) {
     while (a < b && (m_cl.line[a] == ' ' || m_cl.line[a] == '\t')) a++;
     while (b > a && (m_cl.line[b - 1] == ' ' || m_cl.line[b - 1] == '\t')) b--;
     if (b > a && m_synth_in >= 0) {
-        m_cl.line[b] = '\n';
-        if (write(m_synth_in, m_cl.line + a, b - a + 1) < 0 && !wouldblock())
+        char spoken[2 * sizeof m_cl.line + 1];
+        size_t n = speech_normalize_titles(m_cl.line + a, b - a, spoken);
+        spoken[n++] = '\n';
+        if (write(m_synth_in, spoken, n) < 0 && !wouldblock())
             fprintf(stderr, "voicecat: mouth synth pipe broke\n");
     }
     m_cl.ln = 0;
@@ -859,7 +862,8 @@ static int m_is_after(char c) {
            c == '*' || c == ')' || c == '"' || c == '\'' || c == ']';
 }
 static void m_emit(char c) {
-    if (m_cl.ln > 0 && m_is_punct(m_cl.line[m_cl.ln - 1]) && m_is_after(c))
+    if (m_cl.ln > 0 && m_is_punct(m_cl.line[m_cl.ln - 1]) && m_is_after(c) &&
+        !speech_title_continues(m_cl.line, m_cl.ln, c))
         m_flush_line();
     if (m_cl.ln < sizeof m_cl.line - 2) m_cl.line[m_cl.ln++] = c;
 }

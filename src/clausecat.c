@@ -19,6 +19,7 @@
 // the sandbox where changes are tried first; keep the two in agreement.
 #include <stdio.h>
 #include <string.h>
+#include "speech_titles.h"
 
 #ifdef _WIN32
 #include <io.h>
@@ -60,7 +61,9 @@ static void flush_line(void) {
     while (a < b && (line[a] == ' ' || line[a] == '\t')) a++;
     while (b > a && (line[b - 1] == ' ' || line[b - 1] == '\t')) b--;
     if (b > a) {
-        fwrite(line + a, 1, b - a, stdout);
+        char spoken[2 * sizeof line + 1];
+        size_t n = speech_normalize_titles(line + a, b - a, spoken);
+        fwrite(spoken, 1, n, stdout);
         putchar('\n');
         fflush(stdout);
     }
@@ -68,7 +71,7 @@ static void flush_line(void) {
 }
 
 static void emit(char c) {              // speakable char: boundary check, then append
-    if (ln > 0 && is_punct(line[ln - 1]) && is_after(c))
+    if (ln > 0 && is_punct(line[ln - 1]) && is_after(c) && !speech_title_continues(line, ln, c))
         flush_line();
     if (ln < sizeof line - 1) line[ln++] = c;
 }

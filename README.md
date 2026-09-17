@@ -7,6 +7,12 @@ coupling is the wire protocol in `proto/lg_media_proto.h`, a self-contained copy
 little-gemma's media frame format — a one-way dependency (tools → the protocol),
 never the reverse.
 
+## OpenAI-style chat API
+
+A separate Flask adapter exposes a dedicated little-gemma UNIX socket through
+`/v1/models` and `/v1/chat/completions`, with text history and SSE streaming.
+See [setup, client examples and compatibility limits](docs/openai-api.md).
+
 ## mmcat — multimodal cat
 
 The successor to little-gemma's bundled `media_cat`. Where `media_cat` needs a
@@ -289,6 +295,12 @@ can start speaking at the first comma instead of the first newline. The model's
 own punctuation is the split policy; the runner repo's `docs/voice-sys.txt` is
 what makes it appear within the first few words.
 
+Personal titles (`Mr.`, `Mrs.`, `Ms.`, `Dr.`, `Prof.`, `Rev.`) stay with the
+following name. The TTS copy removes or expands their abbreviation periods so
+eSpeak does not create another sentence break: `Mrs. Byers` is sent as
+`Mrs Byers`. Voicecat and the browser demo preserve original transcript text.
+Ordinary punctuation still flushes immediately; this adds no buffering timer.
+
 ```
 voicecat /tmp/lg.sock … | clausecat | piper -m voice.onnx --output-raw --stream     | aplay -r 22050 -f S16_LE -t raw -c 1 -
 ```
@@ -374,3 +386,10 @@ them with `--whisper-model` / `--whisper-bin` or `LG_WHISPER_MODEL` /
 
 ## License
 MIT (see `LICENSE`), matching little-gemma.
+
+### Device voice dashboard
+
+For physical microphones/speakers, model status, volume controls, lip sync,
+expressions/gestures, and a two-device teacher–student conversation, see the
+[device voice UI guide](docs/device-voice-ui.md). The browser monitors the devices;
+it does not use its own microphone or speaker.

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Voice classroom · {{ name }}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head>
+<body><header><div><small>DEVICE VOICE LAB</small><h1>Two voices. One conversation.</h1>Live microphones and speakers on the devices. Your browser only monitors and controls.</div><span class="badge">Physical audio</span></header>
+<main><section class="session"><div class="section-head"><h2>Teacher & student</h2><strong id="session-state">Idle</strong></div>
+<div class="session-fields"><label>Topic<input id="topic" value="The geography of the American Midwest"></label><label>Duration<select id="duration"><option value="900">15 minutes</option><option value="180">3 minutes</option><option value="60">1 minute</option><option value="600">10 minutes</option></select></label><label>Turn limit<input id="turns" type="number" min="1" max="48" value="48"></label>
+<small class="session-remark">1–48 input turns, including the opening prompt</small></div>
+<div class="actions"><button id="begin" {% if not peer %}disabled{% endif %}>Start conversation</button><button id="end" class="danger">Stop both</button><button id="record" class="secondary" hidden>Record</button><span id="session-detail">Teacher begins. Each device hears the other through its microphone.</span></div><p id="recording-state" role="status" aria-live="polite" hidden></p><p id="recording-error" class="error" role="alert"></p><p id="session-error" class="error" role="alert"></p></section>
+<div id="devices" class="devices"></div>
+<footer>Lip sync follows Piper’s phoneme schedule and the device playback queue estimate. Adjust visual offset to match the real speaker. No browser microphone or audio playback.</footer></main>
+<template id="device-template"><section class="device"><div class="section-head"><div><small class="role"></small><h2 class="name">Connecting…</h2><small class="loaded">No model loaded</small></div><span class="phase badge">Connecting</span></div>
+<div class="portrait-row"><div class="portrait" aria-label="Live expression and lipsync"><div class="eyes"><i></i><i></i></div><div class="mouth"></div></div><div class="metadata"><strong class="expression">neutral</strong><span class="gesture">quiet</span><span class="phoneme">—</span><small class="alignment">Waiting for phonemes</small></div></div>
+<div class="volume-row"><label>Speaker volume <output class="volume-value">—</output><input class="volume" type="range" min="0" max="100" step="1" value="82"></label><button class="mute secondary icon-button" aria-label="Mute speaker" title="Mute speaker"><span class="icon-enabled">{% include "icons/speaker-2-24-regular.svg" %}</span><span class="icon-muted">{% include "icons/speaker-mute-24-regular.svg" %}</span></button></div>
+<div class="volume-row"><label>Microphone volume <output class="mic-volume-value">—</output><input class="mic-volume" type="range" min="0" max="100" step="1" value="100" disabled></label><button class="mic-mute secondary icon-button" aria-label="Mute microphone" title="Mute microphone" disabled><span class="icon-enabled">{% include "icons/mic-24-regular.svg" %}</span><span class="icon-muted">{% include "icons/mic-prohibited-24-regular.svg" %}</span></button></div><small class="mic-state">Checking hardware capture mute…</small>
+<details><summary>Models, prompt & device details</summary><label>Model<select class="model"></select></label><dl class="models"></dl><label>System prompt<textarea class="prompt" rows="7"></textarea></label><label><input class="auto-gestures" type="checkbox"> Automatic speech gestures</label><label>Visual offset (ms)<input class="offset" type="number" min="-500" max="1000" step="10" value="100"></label><small>Display-only adjustment; does not change audio timing.</small></details>
+<div class="actions"><button class="load secondary">Load pipeline</button><button class="hello secondary">Say hello</button><button class="stop secondary">Stop device</button></div>
+<p class="operation" role="status" aria-live="polite" hidden></p>
+<div class="transcript"><small>HEARD</small><p class="heard">Waiting for speech.</p><small>SAID</small><p class="said">No reply yet.</p></div>
+<details><summary>Live metadata</summary><pre class="events"></pre></details><p class="error" role="alert"></p></section></template>
+<script>window.VOICE_CONFIG={{ {'key':key,'visemes':visemes,'phonemes':phonemes,'peer':peer,'role':role}|tojson }};</script>
+<script src="{{ url_for('static', filename='gestures.js') }}"></script>
+<script src="{{ url_for('static', filename='app.js') }}"></script></body></html>

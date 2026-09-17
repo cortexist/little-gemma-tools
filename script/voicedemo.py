@@ -41,6 +41,7 @@ import threading
 import time
 
 from flask import Flask, Response, render_template_string, request
+from speech_titles import normalize_titles, title_continues
 
 # ---- the reply framing (piper.mux's TLV, re-stated: 10 lines beat a dep) ----
 def frame(kind, payload):
@@ -358,7 +359,7 @@ class Pipeline:
                 if clause:
                     q.put(frame(b"R", clause.encode("utf-8")))
                     try:
-                        self.piper.stdin.write(clause.encode("utf-8") + b"\n")
+                        self.piper.stdin.write(normalize_titles(clause).encode("utf-8") + b"\n")
                         self.piper.stdin.flush()
                     except (BrokenPipeError, OSError):       # text still flows, audio doesn't
                         pass
@@ -411,7 +412,8 @@ class Pipeline:
                             speak(out)
 
                     def add(c):
-                        if clause[0] and clause[0][-1] in ",;:.!?" and c in " \t\n\r\f\v*)\"']":
+                        if (clause[0] and clause[0][-1] in ",;:.!?" and c in " \t\n\r\f\v*)\"']"
+                                and not title_continues(clause[0], c)):
                             flush()
                         clause[0] += c
 

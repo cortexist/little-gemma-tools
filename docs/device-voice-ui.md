@@ -21,7 +21,7 @@ Copy `script/deviceui/config.example.json` to a private local configuration file
 - `role` is `teacher` or `student`, used for the single-device page's defaults.
 - `ff_socket` attaches to an existing far-field-service, which the UI does not stop. Omit it to let the UI start its own service. For a temporary input profile switch, additionally set `card` to the exact Pulse card name and `capture_profile` to the desired profile. The prior profile is restored on stop. Volume is never reset on start/stop.
 - `whisper_command` starts an owned resident server. Omit it to attach to an existing server at `whisper_health`/`whisper_url`. Voicecat needs whisper.cpp-compatible timestamped VTT, not a JSON-only transcription endpoint. The ASR/model labels are configuration, while owned process liveness and HTTP readiness are checked separately.
-- `piper` is an argv list for the [streaming Piper fork](https://github.com/cortexist/piper), with `--output-mux`, `--stream` and `--volume` support. The dashboard consumes its configuration, PCM, phoneme-alignment and voice-metadata frames; turn completion uses an echoed, silent `set_voice` metadata sentinel. `voice` must have its config and streaming encoder/decoder companions. To expose actual phoneme durations, regenerate split halves with that fork's `python -m piper.split VOICE.onnx`. Use a separate copy/output directory when preserving existing exports. No schedule means the UI explicitly reports that lip sync is unavailable.
+- `piper` is an argv list; `voice` must have its config and streaming encoder/decoder companions. To expose actual phoneme durations, regenerate split halves with the Piper fork's current `python -m piper.split VOICE.onnx`. Use a separate copy/output directory when preserving existing exports. No schedule means the UI explicitly reports that lip sync is unavailable.
 - `peer` is needed only on the dashboard coordinating both devices. It contains the other agent's fixed URL and key. Both agents are controlled under the same OS user that owns their audio session.
 
 ```sh
@@ -127,7 +127,7 @@ The tests cover API key/origin boundaries, POST-only mutation, volume units, bou
 
 ## Microphone controls
 
-Microphone volume appears beneath speaker volume and uses the desktop capture-volume scale (0–100%). **Mute microphone** sets the system source mute and the configured ALSA capture switches; status distinguishes **Hardware capture muted**, **System capture muted**, and **Hardware capture enabled**. This works even when the inference pipeline is stopped. The UI uses a single microphone mute control. Explicit unmute also enables listening on a ready pipeline; loading from the UI enables listening but preserves hardware mute. The internal `listen` API remains available to the coordinator.
+Speaker and microphone controls share a compact icon bar. Click either icon to open its vertical volume slider and mute button; click outside or press Escape to close it. Both sliders use the desktop volume scale (0–100%). **Mute microphone** sets the system source mute and the configured ALSA capture switches; status distinguishes **Hardware capture muted**, **System capture muted**, and **Hardware capture enabled**. This works even when the inference pipeline is stopped. The UI uses a single microphone mute control. Explicit unmute also enables listening on a ready pipeline; loading from the UI enables listening but preserves hardware mute. The internal `listen` API remains available to the coordinator.
 
 For supported arrays, configure `capture_controls` with the ALSA simple capture switch names (the tested XVF3800 arrays expose `Headset,0` and `Headset,1`). The source's ALSA card is resolved from its properties, including when its capture profile changes. Hardware mute is unavailable if no controls are configured, and control/readback errors are shown rather than claiming success.
 
@@ -178,3 +178,102 @@ The teacher prompt explicitly asks the model to wait. The option is off by
 default, preserves the selected model and MTP settings, and also stops at quoted
 or rhetorical questions. Use it for the classroom's one-question-per-turn role,
 not for unrestricted long-form responses.
+
+
+## Optional peer voice identity
+
+The `speaker_identity` configuration starts an independent CPU worker on the
+processed microphone tap. Each device estimates the voice it hears: the teacher
+can track the student, and the student can track any enrolled teacher voice.
+The configured local TTS selection does not establish the identity of the peer.
+The dashboard shows **Voice heard**, labels matches as estimates, and keeps the
+last identified peer explicitly historical while quiet, uncertain, or reconnecting.
+A new speech segment must establish its identity again.
+
+Use `script/deviceui/config.collections.example.json` for the collection-based
+configuration. `enabled` defaults to false. The optional worker Python environment
+needs NumPy and sherpa-onnx; these do not belong in Flask's environment. `model` is
+an embedding ONNX model; `profiles` is an NPZ containing normalized embedding rows
+and `speakers` (distinct enrollment voice IDs). Both SHA-256 fields must match.
+Every known speaker's `voice_id` must be enrolled with the same model/preprocessing.
+Additional enrolled voices compete as unassigned voices and never become known
+collection members automatically.
+
+### Collections and stable speaker IDs
+
+`script/deviceui/speakers.json` stores `collections`, keyed by unique collection ID.
+Each collection has `speakers`, keyed by stable speaker ID. The identity is the
+pair `(collection_id, speaker_id)`, never a display name or filename. Names may
+repeat; the same voice may occur in different collections. Within a collection,
+both enrollment `voice_id` and Piper `voice` filename must be unique. Required
+metadata: `display_name`, `voice_id`, `voice`, `face_color` (six-digit hex), `role`.
+Optional metadata includes `address_name`, `pronunciation`, age and gender. Renaming
+a speaker leaves its ID unchanged. Runtime enrollment/renaming is future work.
+
+Set `speaker_collection_id` on each device; optionally set `speaker_collections`
+to an absolute JSON path (default: adjacent `speakers.json`). The configured local
+Piper filename resolves the device's own speaker. The classroom collection has
+Catherine Byers / Mrs. Byers (`lessac`), Linda Johnson / Mrs. Johnson (`ljspeech`),
+and Chey, pronounced like "shy" (`ozgirl`). `speaker_identity.peer_speaker_ids` is
+`["chey"]` on the teacher and `["catherine-byers", "linda-johnson"]` on the student.
+Replace the old `names` and `peer_voice_ids` configuration during migration.
+The previous `config.example.json` is the pre-collection example.
+
+All enrolled voices compete before the peer filter, so local or unassigned speech
+is not forcibly assigned to the peer. Unknown or closely matched voices abstain.
+The default threshold/margin and two-confirmation rule are starting operating
+points, not calibrated probabilities. First comparison: 500 ms of detected speech;
+subsequent comparisons: every 250 ms, retaining at most two seconds of PCM. Room
+accuracy and VAD boundaries still need measurement.
+
+The **VOICE HEARD** indicator uses a small, expressionless face: the confirmed
+speaker's collection color, light gray for an unknown speaker without history,
+or a faded last-known color explicitly labeled historical. Paused, expired or
+uncertain estimates never become current speaker identities. The server validates
+collection/speaker/voice IDs and supplies canonical metadata to the UI.
+
+Recognition remains **UI-only**: events carry `attribution: estimate`,
+`overlap_checked: false`, `allow_named_address: false`. No uncertain recognition
+result is inserted into model context or used as transcript attribution.
+Separately, lesson setup supplies the **configured** participants to the system
+prompt. Chey is asked to use the selected teacher's address name naturally,
+particularly around questions, without repeating it every turn. Selecting the
+Johnson voice before restarting the dashboard/lesson changes that address to
+Mrs. Johnson. A direct Load uses the peer metadata currently shown in the dashboard;
+a coordinated conversation refreshes both devices' configured identities before
+loading. An unknown configured peer supplies no name. Full diarization and runtime
+identity changes during a lesson remain future features.
+
+The worker cannot back-pressure the main audio path. Its capture queue is bounded
+to 320 ms; overflow or an observed capture stall resets its current evidence. The
+current tap protocol has no sample sequence number, so upstream losses are not
+individually measurable. A missing heartbeat expires the live label after three
+seconds. Local playback and paused listening cannot establish a peer in the
+dashboard; old playback-time matches do not become fresh matches afterward. If
+the optional worker fails, its status becomes unavailable while the main voice
+pipeline continues. A session restart clears peer identity.
+
+
+### Character colors
+
+Speaker face colors are defined in `speakers.json`: Mrs. Byers keeps light green
+`#e2ebd7`, Mrs. Johnson uses light blue `#d5e5f5`, and Chey uses light purple
+`#e4d7f2`. `characters.json` now supplies only theme defaults, including the gray
+unknown face and pink happy cheeks. Full portraits preserve the speaker color
+through emotions; happiness adds two cheek patches. Small identity faces have no
+expressions or gestures. Deploy the same collection JSON to both nodes and restart
+the dashboards after editing it; new prompts take effect on the next pipeline load.
+
+### Panel identity and final playback
+
+Panel titles use the selected speaker's `display_name`; config `name` is the
+fallback for unassigned voices. Set `platform` to the device's hardware label.
+The HOST · PLATFORM row pairs it with the actual short system hostname and sits
+between VOICE HEARD and the model details.
+
+At the conversation turn limit, `finish-turn` closes model input while allowing
+UI peer identification until final playback drains on both sides. A waiting
+device shows phase `finishing`; new prompt requests are rejected during this
+stage. Explicit listening pauses still gate identity, and local playback and
+stale worker heartbeats still suppress current matches. Worker shutdown ends
+tracking as before. No extra response is generated from the final heard speech.

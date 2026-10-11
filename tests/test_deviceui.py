@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 path = Path(__file__).resolve().parents[1]/'script/deviceui/server.py'
 spec = importlib.util.spec_from_file_location('deviceui', path)
@@ -12,6 +12,74 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 class DeviceTests(unittest.TestCase):
+    def test_first_manual_load_after_room_stop_ignores_old_dead_piper(self):
+        device = self.app.device
+        device.procs['piper'] = Mock(poll=Mock(return_value=-15))
+        device.procs['speaker-id'] = Mock(poll=Mock(return_value=0))
+        with patch.object(module.threading, 'Thread') as thread:
+            device.start(dict(profile='test', system_prompt='Hello.'))
+            thread.return_value.start.assert_called_once()
+        self.assertEqual(device.procs, {})
+        device.procs['engine'] = Mock(poll=Mock(return_value=None))
+        device.check_processes('Startup')
+        # A real leftover owner must never be silently forgotten.
+        device.thread = None
+        with self.assertRaisesRegex(ValueError, 'still running'):
+            device.start(dict(profile='test', system_prompt='Hello.'))
+
+    def test_startup_error_names_the_failed_process_exit_and_log(self):
+        device = self.app.device; device.directory = Path(self.tmp.name)
+        device.procs.update(engine=Mock(poll=Mock(return_value=None)),
+                            whisper=Mock(poll=Mock(return_value=7)))
+        with self.assertRaisesRegex(RuntimeError, r'Startup process exited: whisper \(exit 7\).*whisper.log'):
+            device.check_processes('Startup')
+
+    def test_room_stop_removes_reaped_processes_before_manual_load(self):
+        from windows_audio import WindowsDeviceMixin
+        device = self.app.device
+        piper = Mock(poll=Mock(return_value=-15), wait=Mock(return_value=-15))
+        device.procs['piper'] = piper
+        WindowsDeviceMixin.terminate_owned(device)
+        self.assertEqual(device.procs, {})
+        piper.terminate.assert_not_called()
+        device.check_processes('Startup')
+
+    def test_snapshot_during_intentional_shutdown_is_stopping_not_error(self):
+        device = self.app.device
+        device.state.update(ready=True, phase='paused')
+        device.procs['engine'] = Mock(poll=Mock(return_value=-15))
+        device.cancel.set()
+        state = device.snapshot()['state']
+        self.assertEqual(state['phase'], 'stopping')
+        self.assertFalse(state['ready'])
+        self.assertEqual(state['error'], '')
+        # A dead worker without cancellation is still a genuine failure.
+        device.cancel.clear()
+        state = device.snapshot()['state']
+        self.assertEqual(state['phase'], 'error')
+        self.assertFalse(state['ready'])
+        self.assertIn('process exited', state['error'])
+
+    def test_stop_marks_not_ready_before_terminating_room_processes(self):
+        device = self.app.device
+        device.state.update(ready=True, phase='paused')
+        def terminate():
+            self.assertTrue(device.cancel.is_set())
+            self.assertFalse(device.state['ready'])
+            self.assertEqual(device.snapshot()['state']['phase'], 'stopping')
+        device.room = Mock(terminate_owned=Mock(side_effect=terminate))
+        device.stop()
+        device.room.terminate_owned.assert_called_once()
+
+    def test_shutdown_does_not_hide_an_existing_pipeline_error(self):
+        device = self.app.device
+        device.state.update(ready=True, phase='error', error='Engine failed')
+        device.cancel.set()
+        state = device.snapshot()['state']
+        self.assertEqual(state['phase'], 'error')
+        self.assertEqual(state['error'], 'Engine failed')
+        self.assertFalse(state['ready'])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.cfg = dict(name='test', key='test-key', runtime_dir=self.tmp.name, sink='test-sink', source='test-source',
@@ -23,6 +91,20 @@ class DeviceTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_decision_head_metadata_is_profile_specific_and_does_not_claim_loaded(self):
+        self.cfg['turn_head'] = dict(mode='control', backend='c', library='/native.so',
+            models={'test': dict(path='/decision.gguf', sha256='pinned')},
+            packages={'test': '/preserved-npz'})
+        data = self.app.device.snapshot()
+        self.assertEqual(data['decision_heads']['test'],
+            dict(model='/decision.gguf', backend='c', mode='control'))
+        self.assertFalse(data['state']['ready'])
+        self.cfg['turn_head']['backend'] = 'numpy'
+        self.assertEqual(self.app.device.snapshot()['decision_heads']['test']['model'].replace('\\', '/'),
+                         '/preserved-npz/head.npz')
+        self.cfg.pop('turn_head')
+        self.assertEqual(self.app.device.snapshot()['decision_heads']['test']['mode'], 'off')
 
     def test_question_boundary_is_opt_in_and_keeps_selected_model(self):
         cfg = dict(engine='/engine', end_on_question=True)
@@ -66,6 +148,29 @@ class DeviceTests(unittest.TestCase):
         device.state.update(expression='sad', synth_count=0)
         with patch.object(module.time, 'time', return_value=16):
             self.assertEqual(device.snapshot()['state']['expression'], 'sad')
+
+    def test_hello_reaction_is_applied_once_at_playback_and_canceled_on_stop(self):
+        device = self.app.device
+        device.state.update(ready=True, phase='paused')
+        with patch.object(device, 'command') as command:
+            response = self.client.post('/api/local/prompt', headers=self.headers,
+                json=dict(text='Say hello.', reaction='happy'))
+            self.assertEqual(response.status_code, 200)
+            command.assert_called_once_with('prompt Say hello.')
+        self.assertEqual(device.state['expression'], 'neutral')
+        self.assertEqual(device.pending_reaction, 'happy')
+        device.emit('play', '0\t0\t640\t16000')
+        device.emit('play', '0\t640\t640\t16000')
+        self.assertEqual([(e['kind'], e['text']) for e in device.events
+                          if e.get('source') == 'manual_reaction'], [('expression', 'happy')])
+        device.pending_reaction = 'sad'
+        device.emit('stopped')
+        device.emit('play', '0\t0\t640\t16000')
+        self.assertEqual(device.state['expression'], 'happy')
+        self.assertIsNone(device.pending_reaction)
+        with patch.object(device, 'command', side_effect=ValueError('not ready')):
+            with self.assertRaises(ValueError): device.prompt('Hello.', reaction='happy')
+        self.assertIsNone(device.pending_reaction)
 
     def test_microphone_validates_and_sets_all_hardware_capture_switches(self):
         device = self.app.device
@@ -129,7 +234,10 @@ class VoicecatProtocolTests(unittest.TestCase):
     def test_silent_eos_still_completes_synthesis(self):
         self.check_reply(b'[neutral]<eos>', fragmented=True, spoken=False)
 
-    def check_reply(self, payload, fragmented=False, spoken=True):
+    def test_turn_limit_blocks_further_prompts_and_reenabling_listening(self):
+        self.check_reply(b'<|channel>thought\n<channel|>[happy] Hello [nod] there.<turn|>', turn_limit=1)
+
+    def check_reply(self, payload, fragmented=False, spoken=True, turn_limit=None):
         import os, socket, struct, subprocess, threading, time
         binary=os.environ.get('VOICECAT_TEST_BIN')
         if not binary: self.skipTest('set VOICECAT_TEST_BIN to exercise the compiled binary')
@@ -151,7 +259,8 @@ class VoicecatProtocolTests(unittest.TestCase):
             threading.Thread(target=reply,daemon=True).start()
             proc=subprocess.Popen([binary,str(root/'lg'),'--stdin-pcm','--start-muted','--clock','0','--idle-compress','0','--mood-route',
                 '--monitor-sock',str(root/'events'),'--control-sock',str(root/'control'),
-                '--mouth-synth',module.shlex.join([module.sys.executable,str(synth)]),'--mouth-play','cat >/dev/null'],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                '--mouth-synth',module.shlex.join([module.sys.executable,str(synth)]),'--mouth-play','cat >/dev/null']+
+                (['--turn-limit',str(turn_limit)] if turn_limit else []),stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             done=threading.Event()
             def feed():
                 try:
@@ -174,6 +283,21 @@ class VoicecatProtocolTests(unittest.TestCase):
                 clauses=[e['text'] for e in events if e['kind']=='clause']
                 self.assertEqual(clauses,['Hello  there.'] if spoken else [])
                 if not spoken:self.assertNotIn('play',kinds)
+                if turn_limit:
+                    with socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM) as control:
+                        control.sendto(b'listen 1',str(root/'control'))
+                        control.sendto(b'prompt One more.',str(root/'control'))
+                    rejected=False
+                    deadline=time.time()+1
+                    while time.time()<deadline and not rejected:
+                        try:
+                            event=json.loads(monitor.recv(65536));events.append(event)
+                            rejected=event['kind']=='rejected' and event['text']=='turn limit reached'
+                        except socket.timeout:pass
+                    self.assertTrue(rejected)
+                    self.assertEqual(sum(e['kind']=='input_done' for e in events),1)
+                    self.assertTrue(any(e['kind']=='listening' and e['text']=='0' for e in events))
+                    self.assertFalse(any(e['kind']=='listening' and e['text']=='1' for e in events))
             finally:
                 done.set();time.sleep(.03);proc.stdin.close()
                 try:proc.wait(timeout=5)

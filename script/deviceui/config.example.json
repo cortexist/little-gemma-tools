@@ -47,5 +47,42 @@
   "capture_controls": [
     "Headset,0",
     "Headset,1"
-  ]
+  ],
+  "speaker_identity": {
+    "enabled": false,
+    "backend": "camplus",
+    "python": "/persistent/speaker-env/bin/python",
+    "model": "/persistent/speaker/model.onnx",
+    "model_sha256": "replace-with-model-sha256",
+    "profiles": "/persistent/speaker/profiles.npz",
+    "profiles_sha256": "replace-with-profiles-sha256",
+    "threshold": 0.425,
+    "margin": 0.1,
+    "confirmations": 2,
+    "vad_level": 200,
+    "peer_voice_ids": [
+      "ozgirl"
+    ],
+    "names": {
+      "lessac": {
+        "display_name": "Catherine Byers",
+        "address_name": "Mrs. Byers"
+      },
+      "ljspeech": {
+        "display_name": "Linda Johnson",
+        "address_name": "Mrs. Johnson"
+      },
+      "arctic_awb": {
+        "display_name": "arctic_awb"
+      },
+      "hfc_male": {
+        "display_name": "hfc_male",
+        "address_name": "HiFi Captain"
+      },
+      "ozgirl": {
+        "display_name": "Claire",
+        "address_name": "Claire"
+      }
+    }
+  }
 }

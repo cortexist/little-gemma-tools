@@ -18,18 +18,34 @@ import tempfile
 import threading
 import time
 import urllib.request
+import uuid
 
-from flask import Flask, jsonify, render_template, request, send_from_directory
+from flask import Flask, Response, jsonify, render_template, request, send_from_directory
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from recording import Recording
+from speaker_collections import load_collection, identity_prompt
 sys.path.insert(0, str(HERE.parent))
 from voicedemo import load_visemes, PHONEME_TO_VISEME
 
 
 def run(args):
     return subprocess.check_output(args, text=True, timeout=5)
+
+
+def decision_head_details(cfg):
+    """Configured assets only; loaded runtime comes from room.turn_head.runtime."""
+    settings = cfg.get('turn_head', {})
+    backend = settings.get('backend', 'numpy')
+    mode = settings.get('mode', 'off')
+    result = {}
+    for profile in cfg['profiles']:
+        package = settings.get('packages', {}).get(profile)
+        model = (settings.get('models', {}).get(profile, {}).get('path') if backend == 'c'
+                 else str(Path(package)/'head.npz') if package else None)
+        result[profile] = dict(model=model, backend=backend, mode=mode)
+    return result
 
 
 def stop_tree(proc):
@@ -67,6 +83,13 @@ def engine_command(cfg, selected, system_file, socket_path):
 class Device:
     def __init__(self, config):
         self.cfg = config
+        self.instance_id = uuid.uuid4().hex
+        self.collection = load_collection(config)
+        self.speaker = self.collection.for_model(config['voice']) if self.collection else None
+        identity_cfg = config.get('speaker_identity', {})
+        self.peer_speakers = self.collection.allowed(identity_cfg) if identity_cfg.get('enabled') else set()
+        if self.speaker and config.get('role') and self.speaker['role'] != config['role']:
+            raise ValueError('Configured device role and speaker role differ')
         self.root = Path(config['runtime_dir']).expanduser()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.capture_lock = threading.RLock()
@@ -77,18 +100,29 @@ class Device:
         self.events = deque(maxlen=1000)
         self.serial = 0
         self.procs = {}
+        self.optional_procs = {'speaker-id'}
         self.thread = None
         self.telemetry = None
         self.directory = None
+        self.room = None
         self.audio_before = None
-        self.state = dict(name=config['name'], phase='stopped', ready=False, listening=False,
+        self.pending_reaction = None
+        self.state = dict(name=self.speaker['display_name'] if self.speaker else config['name'],
+                          phase='stopped', ready=False, listening=False, finishing=False,
                           input='', reply='', reply_spoken=False, history=[], input_count=0, reply_count=0, expression='neutral',
                           gesture='quiet', synth_count=0, synth_bytes=0, played_bytes=0, error='', alignment=False, audible_until=0,
-                          profile=None, started=None, volume=None, audio_error='', components={})
+                          profile=None, started=None, volume=None, audio_error='', components={},
+                          speaker_identity={'status': 'stopped' if config.get('room_identity') else 'disabled'}, speaker_suppress_until=0)
         threading.Thread(target=self.audio_poll, daemon=True).start()
 
     def emit(self, kind, text='', **fields):
         with self.lock:
+            if kind in ('cut', 'stopped', 'reset'):
+                self.pending_reaction = None
+            if kind == 'play' and getattr(self, 'pending_reaction', None):
+                cue, self.pending_reaction = self.pending_reaction, None
+                self.state['expression'] = cue
+                self.emit('expression', cue, source='manual_reaction')
             self.serial += 1
             event = dict(id=self.serial, kind=kind, text=text, at=time.time())
             event.update(fields)
@@ -229,11 +263,22 @@ class Device:
                     and st['played_bytes'] >= st['synth_bytes'] and now >= st['audible_until']):
                 st['expression'] = 'neutral'
             state = dict(st)
+            identity = dict(st.get('speaker_identity', {'status': 'disabled'}))
+            if identity.get('status') not in ('disabled', 'stopped'):
+                if now-st.get('speaker_identity_at', 0) > 3:
+                    identity.update(status='unavailable', speaker_id=None, voice_id=None, display_name=None, face_color=None)
+                elif (not st['listening'] and not st.get('finishing')) or now < st.get('speaker_suppress_until', 0):
+                    identity.update(status='paused', speaker_id=None, voice_id=None, display_name=None, face_color=None)
+            state['speaker_identity'] = identity
             state['components'] = {name: {'pid': p.pid, 'alive': p.poll() is None} for name, p in self.procs.items()}
+            # Cancellation deliberately reaps children before final cleanup.
+            # Polling during that interval must not report a worker crash.
+            if state['ready'] and self.cancel.is_set():
+                state.update(ready=False, phase='error' if state.get('error') else 'stopping')
             if state['ready']:
-                if any(not p['alive'] for p in state['components'].values()):
+                if any(not p['alive'] for name, p in state['components'].items() if name not in self.optional_procs):
                     state['phase'] = 'error'
-                    state['error'] = 'A pipeline process exited; stop and reload to recover.'
+                    state['error'] = state.get('error') or 'A pipeline process exited; stop and reload to recover.'
                     state['ready'] = False
                 elif time.time() < state['audible_until']:
                     state['phase'] = 'speaking'
@@ -241,10 +286,23 @@ class Device:
                         and state['reply_count'] >= state['input_count']
                         and state['synth_count'] >= state['reply_count']
                         and state['played_bytes'] >= state['synth_bytes']):
-                    state['phase'] = 'listening' if state['listening'] else 'paused'
+                    state['phase'] = 'listening' if state['listening'] else 'finishing' if state.get('finishing') else 'paused'
+            if self.room and state['ready'] and self.room.turn_active:
+                state['phase'] = 'speaking' if now < state['audible_until'] else 'thinking'
             return dict(server_time=time.time(), state=state, events=[e for e in self.events if e['id'] > after], cursor=self.serial,
+                        instance_id=self.instance_id,
+                        default_profile=self.cfg.get('default_profile'),
+                        capabilities={'pipeline': not self.cfg.get('controls_only', False),
+                                      'capture': sys.platform != 'win32' and not self.cfg.get('controls_only', False),
+                                      'turn_limits': sys.platform == 'win32' or bool(self.cfg.get('turn_limit_support', False)),
+                                      'room_session': bool(self.cfg.get('room_identity'))},
                         profiles={k: {'label': v.get('label', k), 'model': v['model'], 'head': v.get('head'), 'env': v.get('env', {})}
                                   for k, v in self.cfg['profiles'].items()},
+                        decision_heads=decision_head_details(self.cfg),
+                        speaker=self.speaker, collection_id=self.collection.id if self.collection else None,
+                        role=self.cfg.get('role'),
+                        host={'hostname': socket.gethostname().split('.')[0],
+                              'platform': self.cfg.get('platform', 'Unknown platform')},
                         asr=self.cfg['whisper_model'], voice=self.cfg['voice'], sink=self.cfg['sink'],
                         source=self.cfg['source'], sync_offset_ms=self.cfg.get('sync_offset_ms', 100))
 
@@ -254,16 +312,36 @@ class Device:
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
             s.sendto(text.encode(), str(self.directory/'control.sock'))
 
-    def listen(self, enabled):
-        self.command('listen '+('1' if enabled else '0'))
+    def listen(self, enabled, *, finishing=False):
+        # Closing model input at the turn limit must not hide active peer tracking.
+        # Explicit listening pauses still gate identity; only final playback drains
+        # enable this exception. Playback suppression remains independent.
+        with self.lock:
+            previous = self.state.get('finishing', False)
+            self.state['finishing'] = finishing and not enabled
+            try:
+                self.command('listen '+('1' if enabled else '0'))
+            except Exception:
+                self.state['finishing'] = previous
+                raise
         return {'ok': True}
 
-    def prompt(self, text):
+    def prompt(self, text, reaction=None):
         if not isinstance(text, str) or not text.strip() or len(text.encode()) > 3500:
             raise ValueError('prompt must be 1–3500 bytes')
-        if self.snapshot()['state']['phase'] in ('speaking', 'thinking', 'hearing'):
+        if self.state.get('finishing') or self.snapshot()['state']['phase'] in ('speaking', 'thinking', 'hearing'):
             raise ValueError('pipeline is busy')
-        self.command('prompt '+text)
+        if self.state.get('turn_limit') and self.state['input_count'] >= self.state['turn_limit']:
+            raise ValueError('turn limit reached')
+        if reaction is not None and reaction not in ('happy', 'sad', 'angry', 'neutral'):
+            raise ValueError('unknown expression reaction')
+        with self.lock:
+            self.pending_reaction = reaction
+            try:
+                self.command('prompt '+text)
+            except Exception:
+                self.pending_reaction = None
+                raise
         return {'ok': True}
 
     def spawn(self, name, argv, **kwargs):
@@ -275,29 +353,73 @@ class Device:
         self.emit('process', name, argv=argv, pid=p.pid)
         return p
 
+    def check_processes(self, stage, *, include_optional=False):
+        with self.lock:
+            exited = [(name, p.poll()) for name, p in self.procs.items()
+                      if include_optional or name not in self.optional_procs]
+        for name, code in exited:
+            if code is not None:
+                raise RuntimeError(f'{stage} process exited: {name} (exit {code}); '
+                                   f'see {self.directory / (name+".log")}')
+
     def start(self, data):
+        if self.cfg.get('controls_only', False):
+            raise ValueError('The trio voice pipeline is not configured on this node yet')
         profile = data.get('profile')
         if profile not in self.cfg['profiles']:
             raise ValueError('unknown model profile')
         prompt = data.get('system_prompt', '')
         if not isinstance(prompt, str) or not 1 <= len(prompt) <= 16000:
             raise ValueError('system prompt must be 1–16000 characters')
+        turn_limit = data.get('turn_limit', 0)
+        if type(turn_limit) is not int or not 0 <= turn_limit <= 48:
+            raise ValueError('turn limit must be an integer from 1–48, or 0 for an unbounded manual load')
+        if turn_limit and not self.snapshot()['capabilities']['turn_limits']:
+            raise ValueError('This node needs a voicecat build with turn-limit support')
+        peer_id = data.get('peer_speaker_id')
+        if peer_id is not None and (not self.collection or data.get('peer_collection_id') != self.collection.id
+                                    or not self.collection.speaker(peer_id)):
+            raise ValueError('Peer speaker must belong to the configured collection')
+        prompt += identity_prompt(self.collection, self.speaker, peer_id)
+        room_settings = data.get('room')
+        if room_settings is not None:
+            if (not self.cfg.get('room_identity') or not isinstance(room_settings, dict)
+                    or not re.fullmatch(r'[a-f0-9-]{36}', str(room_settings.get('session', '')))
+                    or not isinstance(room_settings.get('topic'), str)
+                    or not 1 <= len(room_settings['topic']) <= 1000
+                    or room_settings.get('mode', 'active') not in ('active', 'passive')):
+                raise ValueError('Invalid or unavailable room session')
         with self.lifecycle:
             if self.thread and self.thread.is_alive():
                 raise ValueError('pipeline is already loading or running; stop it first')
+            with self.lock:
+                if any(p.poll() is None for p in self.procs.values()):
+                    raise ValueError('previous pipeline processes are still running; stop them first')
+                # Stopped room workers used to leave dead Piper entries here.
+                # Every new load must check only the processes it starts.
+                self.procs.clear()
             self.cancel.clear()
-            self.thread = threading.Thread(target=self.work, args=(profile, prompt, bool(data.get('listen', False))), daemon=True)
+            self.room = None
+            worker = self.work
+            if room_settings is not None:
+                from room_direct import DirectRoomRuntime
+                self.room = DirectRoomRuntime(self, room_settings)
+                worker = self.room.work
+            else:
+                self.state.pop('room', None)
+                self.state['pipeline_mode'] = 'active'
+            self.thread = threading.Thread(target=worker, args=(profile, prompt, bool(data.get('listen', False)), turn_limit), daemon=True)
             self.thread.start()
         return {'ok': True}
 
-    def work(self, profile, prompt, listen):
+    def work(self, profile, prompt, listen, turn_limit=0):
         diagnostics = None
         try:
             self.directory = Path(tempfile.mkdtemp(prefix='session-', dir=self.root))
             with self.lock:
                 self.state.update(phase='loading', ready=False, error='', input='', reply='', history=[], input_count=0,
                                   reply_count=0, reply_spoken=False, expression='neutral', gesture='quiet', synth_count=0, synth_bytes=0, played_bytes=0, last_input='', profile=profile, started=time.time(), alignment=False,
-                                  audible_until=0, listening=False)
+                                  audible_until=0, listening=False, finishing=False, turn_limit=turn_limit, speaker_identity={'status': 'disabled'}, speaker_identity_at=0, speaker_suppress_until=0)
             self.emit('reset')
             (self.directory/'system.txt').write_text(prompt)
             cfg = self.cfg
@@ -316,6 +438,7 @@ class Device:
             elif not Path(ff_sock).is_socket():
                 raise ValueError('configured existing audio service socket is missing')
             env = {k: v for k, v in os.environ.items() if not k.startswith('LG_')}
+            env.update(cfg.get('env', {}))
             env.update(selected.get('env', {}))
             engine = engine_command(cfg, selected, self.directory/'system.txt', lg_sock)
             self.spawn('engine', engine, env=env)
@@ -325,8 +448,7 @@ class Device:
             while True:
                 if self.cancel.wait(.2):
                     return
-                if any(p.poll() is not None for p in self.procs.values()):
-                    raise RuntimeError('startup process exited; see session logs')
+                self.check_processes('Startup')
                 healthy = False
                 try:
                     with urllib.request.urlopen(cfg['whisper_health'], timeout=1) as response:
@@ -342,6 +464,9 @@ class Device:
             self.telemetry.settimeout(.2)
             threading.Thread(target=self.receive, daemon=True).start()
             voice_env = os.environ.copy()
+            voice_env.update(cfg.get('env', {}))
+            if 'name_pronunciations' in cfg:
+                voice_env['VOICE_NAME_PRONUNCIATIONS'] = json.dumps(cfg['name_pronunciations'])
             voice_env.pop('LG_AUDIO_DIAGNOSTICS', None)
             if cfg.get('audio_diagnostics_dir'):
                 diagnostics = Path(cfg['audio_diagnostics_dir']).expanduser()/self.directory.name
@@ -369,6 +494,8 @@ class Device:
                     '--mood-route', '--duck-sock', ff_sock, '--whisper-url', cfg['whisper_url'],
                     '--mouth-synth', synth, '--mouth-play', play, '--monitor-sock', str(self.directory/'events.sock'),
                     '--control-sock', str(self.directory/'control.sock'), '--start-muted']
+            if turn_limit:
+                args += ['--turn-limit', str(turn_limit)]
             self.spawn('voice', args, stdin=tap.stdout, env=voice_env)
             tap.stdout.close()
             deadline = time.time()+60
@@ -381,9 +508,24 @@ class Device:
                 self.state.update(ready=True, phase='paused')
             self.listen(listen)
             self.emit('ready', profile)
+            identity_cfg = dict(cfg.get('speaker_identity', {}))
+            if identity_cfg.get('enabled', False):
+                with self.lock:
+                    self.state['speaker_identity'] = {'status': 'waiting'}
+                    self.state['speaker_identity_at'] = time.time()
+                identity_cfg.update(collection_id=self.collection.id, collection={'speakers': self.collection.speakers})
+                identity_path = self.directory/'speaker-identity.json'
+                identity_path.write_text(json.dumps(identity_cfg))
+                try:
+                    self.spawn('speaker-id', [identity_cfg.get('python', sys.executable), str(HERE/'speaker_identity.py'),
+                               '--config', str(identity_path), '--audio-socket', ff_sock,
+                               '--events-socket', str(self.directory/'events.sock')])
+                except OSError as exc:
+                    self.emit('speaker_identity_error', str(exc))
+                    with self.lock:
+                        self.state['speaker_identity'] = {'status': 'unavailable', 'error': str(exc)}
             while not self.cancel.wait(.25):
-                if any(p.poll() is not None for p in self.procs.values()):
-                    raise RuntimeError('pipeline process exited unexpectedly')
+                self.check_processes('Pipeline')
         except Exception as exc:
             with self.lock:
                 self.state.update(error=str(exc), phase='error')
@@ -405,8 +547,8 @@ class Device:
                     self.emit('error', 'audio profile restore: '+str(exc))
                 self.audio_before = None
             with self.lock:
-                self.state.update(ready=False, listening=False, audible_until=0, piper_config=None,
-                                  expression='neutral', gesture='quiet', gesture_until=0)
+                self.state.update(ready=False, listening=False, finishing=False, audible_until=0, piper_config=None,
+                                  expression='neutral', gesture='quiet', gesture_until=0, speaker_identity={'status': 'stopped'})
                 if not self.state['error']:
                     self.state['phase'] = 'stopped'
             self.emit('stopped')
@@ -429,7 +571,9 @@ class Device:
             kind, text = event['kind'], event['text']
             with self.lock:
                 st = self.state
-                if kind == 'config':
+                if kind == 'speaker_identity':
+                    self.receive_identity(text, event['at'])
+                elif kind == 'config':
                     st['piper_config'] = text
                 elif kind == 'input':
                     st['input'] += text
@@ -441,6 +585,8 @@ class Device:
                     st['reply'] = ''
                     st['reply_spoken'] = False
                     st['input_count'] += 1
+                    if st.get('turn_limit') and st['input_count'] >= st['turn_limit']:
+                        st['finishing'] = True
                     st['phase'] = 'thinking'
                 elif kind == 'reply':
                     st['reply'] = (st['reply']+text)[-16000:]
@@ -464,17 +610,74 @@ class Device:
                     st['played_bytes'] = int(offset)+int(count)
                     st['audible_until'] = float(start)+int(count)/(int(rate)*2)+self.cfg.get('sync_offset_ms', 100)/1000
                     st['phase'] = 'speaking'
+                    st['speaker_suppress_until'] = st['audible_until']+.2
                 elif kind == 'listening':
+                    if text == '1' and not st['listening']:
+                        st['speaker_suppress_until'] = max(st.get('speaker_suppress_until', 0), event['at'])
                     st['listening'] = text == '1'
-                    if st['phase'] in ('paused', 'listening'):
-                        st['phase'] = 'listening' if st['listening'] else 'paused'
+                    if st['phase'] in ('paused', 'listening', 'finishing'):
+                        st['phase'] = 'listening' if st['listening'] else 'finishing' if st.get('finishing') else 'paused'
                 elif kind == 'cut':
-                    st.update(audible_until=0, expression='neutral', gesture='quiet', gesture_until=0)
+                    st.update(audible_until=0, expression='neutral', gesture='quiet', gesture_until=0,
+                              speaker_suppress_until=event['at']+.2)
                 self.emit(kind, text, at=event['at'])
+
+    def receive_identity(self, text, at):
+        """UI-only estimates; final playback drains may track with model input closed."""
+        try:
+            if at < self.state.get('speaker_identity_at', 0):
+                return
+            incoming = json.loads(text)
+            old = self.state.get('speaker_identity', {})
+            last = old.get('last_peer')
+            def canonical(candidate):
+                if not isinstance(candidate, dict) or not self.collection:
+                    return None
+                speaker_id = candidate.get('speaker_id')
+                if candidate.get('collection_id') != self.collection.id or speaker_id not in self.peer_speakers:
+                    return None
+                info = self.collection.speaker(speaker_id)
+                if candidate.get('voice_id') != info['voice_id']:
+                    return None
+                return info
+            candidate = incoming.get('last_peer')
+            info = canonical(candidate)
+            candidate_at = float(candidate.get('at', 0)) if info else 0
+            blocked = ((not self.state['listening'] and not self.state.get('finishing'))
+                       or at < self.state.get('speaker_suppress_until', 0))
+            valid = (info and math.isfinite(candidate_at) and
+                     self.state.get('speaker_suppress_until', 0) < candidate_at <= at)
+            if not blocked and valid and candidate_at >= (last or {}).get('at', 0):
+                last = dict(info, at=candidate_at)
+            current = canonical(incoming)
+            fresh = valid and current and info['speaker_id'] == current['speaker_id']
+            status = incoming.get('status', 'uncertain')
+            if blocked:
+                status = 'paused'
+            elif status == 'identified' and not fresh:
+                status = 'identifying'
+            if blocked or not fresh or status != 'identified':
+                current = {}
+            incoming = dict(current or {}, status=status,
+                            collection_id=self.collection.id if self.collection else None,
+                            speaker_id=(current or {}).get('speaker_id'),
+                            voice_id=(current or {}).get('voice_id'),
+                            display_name=(current or {}).get('display_name'),
+                            last_peer=last, attribution='estimate', mode='single_peer',
+                            allow_named_address=False, overlap_checked=False)
+            self.state['speaker_identity'] = incoming
+            self.state['speaker_identity_at'] = at
+        except (ValueError, TypeError, AttributeError):
+            self.state['speaker_identity'] = {'status': 'unavailable', 'error': 'Invalid identity event'}
 
     def stop(self):
         with self.lifecycle:
-            self.cancel.set()
+            with self.lock:
+                self.cancel.set()
+                if self.state['ready']:
+                    self.state.update(ready=False, listening=False,
+                                      phase='error' if self.state.get('error') else 'stopping')
+            if self.room: self.room.terminate_owned()
             if self.thread:
                 self.thread.join(timeout=20)
                 if self.thread.is_alive():
@@ -485,12 +688,20 @@ class Device:
 def create_app(config):
     app = Flask(__name__, template_folder=str(HERE), static_folder=str(HERE))
     app.config['MAX_CONTENT_LENGTH'] = 65536
-    device = Device(config)
+    device_type = Device
+    if sys.platform == 'win32':
+        from windows_audio import WindowsDeviceMixin
+        class WindowsDevice(WindowsDeviceMixin, Device):
+            pass
+        device_type = WindowsDevice
+    device = device_type(config)
     key = config['key']
     session = dict(active=False, phase='idle', turns=0, error='')
     session_lock = threading.Lock()
     session_stop = threading.Event()
     session_thread = [None]
+    playback_capture = [None]
+    playback_lock = threading.Lock()
 
     def local(action, data=None):
         if action == 'status':
@@ -499,13 +710,20 @@ def create_app(config):
         if action == 'stop': return device.stop()
         if action == 'volume': return device.volume(data)
         if action == 'microphone': return device.microphone(data)
+        if action in ('room-prepare', 'room-grant', 'room-idle', 'room-listen', 'room-open', 'room-permit'):
+            if not device.room: raise ValueError('No room session is loaded')
+            return device.room.control(action, data)
+        if device.room and device.state['ready'] and action in ('listen', 'finish-turn', 'prompt'):
+            raise ValueError('The room coordinator owns listening and speaking; stop the session for manual use')
         if action == 'listen': return device.listen(bool(data['enabled']))
+        if action == 'finish-turn': return device.listen(False, finishing=True)
         if action == 'endpoint-hold':
             ms = int(data['ms'])
             if not 0 <= ms <= 5000: raise ValueError('hold must be 0–5000 ms')
-            device.command('endpoint-hold '+str(ms))
+            if device.room: device.room.hold(ms)
+            else: device.command('endpoint-hold '+str(ms))
             return {'ok': True}
-        if action == 'prompt': return device.prompt(data['text'])
+        if action == 'prompt': return device.prompt(data['text'], reaction=data.get('reaction'))
         raise ValueError('unknown action')
 
     def call(side, action, data=None):
@@ -542,9 +760,13 @@ def create_app(config):
                     and state['played_bytes'] >= state['synth_bytes'] and state['phase'] not in ('speaking', 'thinking'))
         try:
             session.update(phase='loading', error='', turns=0, started=None)
+            participants = {side: call(side, 'status').get('speaker') for side in ['local', 'peer']}
             for side in ['peer', 'local']:
                 call(side, 'stop')
                 settings = dict(data[side], listen=False)
+                other = participants['local' if side == 'peer' else 'peer']
+                settings['peer_speaker_id'] = other['speaker_id'] if other else None
+                settings['peer_collection_id'] = other['collection_id'] if other else None
                 call(side, 'start', settings)
             deadline = time.time()+240
             while not session_stop.wait(.2) and not expired():
@@ -588,7 +810,7 @@ def create_app(config):
                         and any(st['input_count'] > 0 and not st.get('reply_spoken', True) for st in states.values())):
                     return
                 if limit:
-                    for side in ['local', 'peer']: call(side, 'listen', {'enabled': False})
+                    for side in ['local', 'peer']: call(side, 'finish-turn', {})
                     deadline = time.time()+45
                     while not session_stop.wait(.1) and not expired():
                         states = {side: status(side) for side in ['local', 'peer']}
@@ -617,7 +839,8 @@ def create_app(config):
     @app.get('/')
     def index():
         return render_template('index.html', key=key, visemes=load_visemes(), phonemes=PHONEME_TO_VISEME,
-                               name=config['name'], peer=bool(config.get('peer')), role=config.get('role', 'teacher'))
+                               name=device.state['name'], peer=bool(config.get('peer')), role=config.get('role', 'teacher'),
+                               capture=device.snapshot()['capabilities']['capture'], default_prompt=config.get('system_prompt', ''))
 
     @app.route('/api/<side>/<action>', methods=['GET', 'POST'])
     def api(side, action):
@@ -628,6 +851,62 @@ def create_app(config):
             return jsonify(call(side, action, request.args if request.method == 'GET' else request.get_json()))
         except Exception as exc:
             return jsonify(error=str(exc)), 400
+
+    @app.get('/api/recording/asr')
+    def recording_asr():
+        with device.lock:
+            room = device.room
+            if not room or not device.state['ready'] or device.cancel.is_set():
+                return jsonify(error='Room ASR input is not running'), 503
+            if request.args.get('session') != room.session:
+                return jsonify(error='Stale room session'), 409
+        try: capture = room.asr_input.subscribe(device.speaker)
+        except ValueError as exc: return jsonify(error=str(exc)), 409
+        if not capture.ready.wait(5) or capture.error or capture.ended.is_set():
+            capture.close()
+            return jsonify(error=capture.error or 'No PCM from room ASR input'), 503
+        response = Response(iter(capture), mimetype='application/octet-stream', headers={
+            'X-ASR-Protocol': 'little-gemma-asr-input-v1', 'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no'})
+        response.call_on_close(capture.close)
+        return response
+
+    @app.post('/api/recording/asr/stop')
+    def recording_asr_stop():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or not data.get('capture_id'):
+            return jsonify(error='ASR capture ID required'), 400
+        with device.lock:
+            room = device.room
+            if not room or data.get('session') != room.session:
+                return jsonify(error='Stale room session'), 409
+        try: return jsonify(room.asr_input.stop(data['capture_id']))
+        except ValueError as exc: return jsonify(error=str(exc)), 409
+
+    @app.get('/api/recording/pcm')
+    def recording_pcm():
+        from recording_audio import PlaybackCapture
+        with playback_lock:
+            current = playback_capture[0]
+            if current and current.thread.is_alive():
+                return jsonify(error='Speaker output is already being recorded'), 409
+            options = {}
+            if sys.platform != 'win32' and config.get('recording_playback_tap'):
+                with device.lock:
+                    path = (getattr(device.room, 'ff_socket', None) if device.room else
+                            config.get('ff_socket') or (str(device.directory/'ff.sock') if device.directory else None))
+                if not path: return jsonify(error='Voice playback is not running'), 503
+                options['playback_socket'] = path
+            capture = PlaybackCapture(config['sink'], **options)
+            playback_capture[0] = capture
+            try: capture.start()
+            except Exception as exc: return jsonify(error=str(exc)), 503
+        response = Response(iter(capture), mimetype='application/octet-stream', headers={
+            'X-PCM-Format': 's16le', 'X-PCM-Rate': str(capture.rate),
+            'X-PCM-Channels': str(capture.channels), 'Cache-Control': 'no-store',
+            'X-Accel-Buffering': 'no'})
+        response.call_on_close(capture.close)
+        return response
 
     @app.route('/api/recording', methods=['GET', 'POST', 'DELETE'])
     def recording_api():
@@ -662,9 +941,12 @@ def create_app(config):
     def shutdown():
         session_stop.set()
         recording.stop(wait=True)
+        if playback_capture[0]: playback_capture[0].close()
         if session_thread[0] and session_thread[0].is_alive():
             session_thread[0].join(timeout=60)
         device.stop()
+        if hasattr(device, 'audio_shutdown'):
+            device.audio_shutdown.set()
 
     app.shutdown = shutdown
     app.device = device
@@ -681,7 +963,7 @@ def main():
     args = p.parse_args()
     import logging
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
-    cfg = json.loads(args.config.read_text())
+    cfg = json.loads(args.config.read_text(encoding='utf-8-sig'))
     app = create_app(cfg)
     def shutdown(*_):
         app.shutdown()

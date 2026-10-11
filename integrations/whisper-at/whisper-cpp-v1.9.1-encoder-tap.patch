@@ -1,0 +1,92 @@
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index 5ffc70af..1fe842c0 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -22,6 +22,7 @@
+ #include <cmath>
+ #include <climits>
+ #include <cstdarg>
++#include <cstdlib>
+ #include <cstdio>
+ #include <cstring>
+ #include <fstream>
+@@ -877,6 +878,7 @@ struct whisper_state {
+     // result of the encoder
+     struct ggml_tensor * embd_conv = nullptr;
+     struct ggml_tensor * embd_enc  = nullptr;
++    struct ggml_tensor * embd_at   = nullptr; // opt-in private Whisper-AT replay
+ 
+     // helpers for GPU offloading
+     std::vector<float> inp_mel;
+@@ -2095,6 +2097,10 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+ 
+     struct ggml_tensor * inpL = cur;
+ 
++    const bool export_at = std::getenv("WHISPER_AT_FEATURE_PATH") != nullptr;
++    struct ggml_tensor * at_layers = nullptr;
++    wstate.embd_at = nullptr;
++
+     for (int il = 0; il < n_layer; ++il) {
+         const auto & layer = model.layers_encoder[il];
+ 
+@@ -2234,6 +2240,13 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+         }
+ 
+         inpL = ggml_add(ctx0, cur, inpFF);
++        if (export_at) {
++            // Released Whisper-AT pools each block output before final norm.
++            // GGML is [state,time,layer]; raw host order is [layer,time,state].
++            struct ggml_tensor * pooled = ggml_pool_2d(ctx0, inpL,
++                    GGML_OP_POOL_AVG, 1, 20, 1, 20, 0, 0);
++            at_layers = at_layers ? ggml_concat(ctx0, at_layers, pooled, 2) : pooled;
++        }
+     }
+ 
+     cur = inpL;
+@@ -2252,6 +2265,13 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+ 
+     wstate.embd_enc = cur;
+ 
++    if (at_layers) {
++        ggml_set_name(at_layers, "whisper_at_pooled_layers");
++        ggml_set_output(at_layers);
++        ggml_build_forward_expand(gf, at_layers);
++        wstate.embd_at = at_layers;
++    }
++
+     //ggml_graph_print(gf);
+ 
+     ////////////////////////////////////////////////////////////////////////////
+@@ -2433,6 +2453,32 @@ static bool whisper_encode_internal(
+         }
+     }
+ 
++    if (wstate.embd_at) {
++        const char * path = std::getenv("WHISPER_AT_FEATURE_PATH");
++        const std::string temporary = std::string(path) + ".tmp";
++        const auto * tensor = wstate.embd_at;
++        WHISPER_ASSERT(tensor->type == GGML_TYPE_F32);
++        std::vector<float> data(ggml_nelements(tensor));
++        ggml_backend_tensor_get(tensor, data.data(), 0, ggml_nbytes(tensor));
++        const uint32_t dimensions[] = {
++            uint32_t(tensor->ne[2]), uint32_t(tensor->ne[1]),
++            uint32_t(tensor->ne[0]), uint32_t(mel_offset)
++        };
++        FILE * output = std::fopen(temporary.c_str(), "wb");
++        if (!output) {
++            WHISPER_LOG_ERROR("Whisper-AT feature output could not be opened\n");
++            return false;
++        }
++        bool ok = std::fwrite("WAFT", 1, 4, output) == 4;
++        ok = ok && std::fwrite(dimensions, sizeof(dimensions), 1, output) == 1;
++        ok = ok && std::fwrite(data.data(), sizeof(float), data.size(), output) == data.size();
++        ok = std::fclose(output) == 0 && ok;
++        if (!ok || std::rename(temporary.c_str(), path) != 0) {
++            WHISPER_LOG_ERROR("Whisper-AT feature output failed\n");
++            return false;
++        }
++    }
++
+     // cross
+     {
+         auto & sched = wstate.sched_cross.sched;

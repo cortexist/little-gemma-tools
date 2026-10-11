@@ -19,6 +19,8 @@
 //             one; w bit 1: also want 'S' scene frames — meta rides the
 //             data stream, one wire, no side channel)
 //   'm' mouth (payload "rate=NNNNN\n"; one mouth at a time)
+//   'o' output tap (final rendered 16 kHz mono blocks, including idle silence;
+//                  disconnect on backpressure instead of dropping recording PCM)
 // then a mouth streams 'P' pcm (s16 mono at its declared rate — resampled
 // here once, played, and fed to the canceller as reference) and may send
 // 'F' to flush; taps just read 'P' frames of 16 kHz s16 mono (scene taps
@@ -60,10 +62,14 @@
 #endif
 
 #define FF_EARS  'e'
+#define FF_OUTPUT 'o'
 #define FF_MOUTH 'm'
 #define FF_CTRL  'c'                     // a control client: duck/restore frames follow
 #define FF_PCM   'P'
 #define FF_FLUSH 'F'
+#define FF_HOLD  'H'                     // hold at the next supplied word boundary
+#define FF_GRACE 'G'                     // uint32 grace samples, then H boundaries
+#define FF_RESUME 'R'                    // release a held mouth without dropping PCM
 #define FF_DRAIN 'D'                     // "I'm done": play out, then ack one byte —
                                          // hangup WITHOUT it is a cut (the barge)
 #define FF_DUCK  'd'                     // stage-1 barge: playback drops --duck-db,
@@ -88,16 +94,17 @@ static struct aec *g_aec = NULL;
 
 // ---- taps ---------------------------------------------------------------------
 static pthread_mutex_t t_mx = PTHREAD_MUTEX_INITIALIZER;
-static struct { int fd; int raw; int scene; } g_tap[MAXTAP];
+static struct { int fd; int raw; int scene; int output; } g_tap[MAXTAP];
 static int g_ntap = 0;
 
-static void tap_add(int fd, int raw, int scene) {
+static void tap_add(int fd, int raw, int scene, int output) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
     pthread_mutex_lock(&t_mx);
     if (g_ntap < MAXTAP) {
         g_tap[g_ntap].fd = fd;
         g_tap[g_ntap].raw = raw;
         g_tap[g_ntap].scene = scene;
+        g_tap[g_ntap].output = output;
         g_ntap++;
     }
     else close(fd);
@@ -105,19 +112,20 @@ static void tap_add(int fd, int raw, int scene) {
 }
 
 // One 10 ms block to every tap. A slow tap drops blocks (the mic never
-// stalls for a reader); a dead one is reaped in place.
-static void tap_cast(const int16_t *clean, const int16_t *raw) {
+// stalls for a reader); a dead one is reaped in place. Recording taps instead
+// disconnect on ANY lost byte, making an incomplete recording fail explicitly.
+static void tap_cast(const int16_t *clean, const int16_t *raw, const int16_t *output) {
     uint8_t hdr[LG_FRAME_HDR] = { LG_FRAME_MAGIC, FF_PCM };
     uint32_t len = BLOCK * 2;
     memcpy(hdr + 6, &len, 4);
     pthread_mutex_lock(&t_mx);
     for (int i = 0; i < g_ntap; ) {
-        const int16_t *pcm = g_tap[i].raw ? raw : clean;
+        const int16_t *pcm = g_tap[i].output ? output : g_tap[i].raw ? raw : clean;
         uint8_t msg[LG_FRAME_HDR + BLOCK * 2];
         memcpy(msg, hdr, LG_FRAME_HDR);
         memcpy(msg + LG_FRAME_HDR, pcm, BLOCK * 2);
         ssize_t k = send(g_tap[i].fd, msg, sizeof msg, MSG_NOSIGNAL);
-        if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { i++; continue; }   // slow tap: drop the block
+        if (k < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !g_tap[i].output) { i++; continue; }
         if (k != (ssize_t)sizeof msg) {      // dead, or a short write that would desync its stream
             fprintf(stderr, "far-field-service: tap %d dropped (%s)\n",
                     g_tap[i].fd, k < 0 ? strerror(errno) : "short write");
@@ -268,10 +276,41 @@ static pthread_mutex_t m_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  m_cv = PTHREAD_COND_INITIALIZER;
 static int16_t *m_q = NULL;              // 16 kHz mono, already resampled
 static size_t   m_qn = 0, m_qcap = 0;
+static uint64_t m_rendered = 0, m_hold_at = UINT64_MAX;
+static uint64_t m_hold_not_before = 0;
+static int      m_hold_requested = 0;
+static int      m_held = 0;
 #define M_QMAX (RATE * 60)               // a minute of queued speech is a bug
 static int      g_mouth_fd = -1;         // one mouth at a time
 static pa_simple *g_play = NULL;
 static pthread_mutex_t p_mx = PTHREAD_MUTEX_INITIALIZER;   // guards g_play use
+
+// Call with m_mx held. The grace counts real 16 kHz source PCM, not silence
+// injected by the duplex clock. Updates never restart it or move a chosen stop.
+static void mouth_hold_locked(const uint64_t *marks, size_t count, uint32_t grace) {
+    if (!m_hold_requested) {
+        m_hold_requested = 1;
+        m_hold_not_before = m_rendered + grace;
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        fprintf(stderr, "far-field-service: mouth hold pending at %.3f sample %llu grace %u earliest %llu\n",
+                now.tv_sec + now.tv_nsec / 1e9, (unsigned long long)m_rendered,
+                grace, (unsigned long long)m_hold_not_before);
+    }
+    if (m_held) return;
+    for (size_t i = 0; i < count; i++) {
+        if (marks[i] > m_rendered && marks[i] >= m_hold_not_before) {
+            if (marks[i] < m_hold_at) m_hold_at = marks[i];
+            break;
+        }
+    }
+}
+
+static void mouth_resume_locked(void) {
+    m_hold_requested = m_held = 0;
+    m_hold_not_before = 0;
+    m_hold_at = UINT64_MAX;
+}
 
 // The cut clears the QUEUE only — the sink stream is never flushed (a flush
 // jumps the playback clock and the canceller's delay lock with it; measured:
@@ -280,7 +319,36 @@ static pthread_mutex_t p_mx = PTHREAD_MUTEX_INITIALIZER;   // guards g_play use
 static void mouth_flush(void) {
     pthread_mutex_lock(&m_mx);
     m_qn = 0;
+    mouth_resume_locked();
     pthread_mutex_unlock(&m_mx);
+}
+
+static int mouth_take_block(int16_t block[BLOCK]) {
+    int have = 0;
+    pthread_mutex_lock(&m_mx);
+    if (!m_held && m_qn >= BLOCK) {
+        size_t take = BLOCK;
+        if (m_hold_at != UINT64_MAX && m_hold_at <= m_rendered + BLOCK)
+            take = m_hold_at > m_rendered ? (size_t)(m_hold_at - m_rendered) : 0;
+        if (take) {
+            memcpy(block, m_q, take * 2);
+            m_qn -= take;
+            memmove(m_q, m_q + take, m_qn * 2);
+            m_rendered += take;
+            have = 1;
+        }
+        if (take < BLOCK) {
+            memset(block + take, 0, (BLOCK - take) * 2);
+            m_held = 1;
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            fprintf(stderr, "far-field-service: mouth held at %.3f word sample %llu\n",
+                    now.tv_sec + now.tv_nsec / 1e9, (unsigned long long)m_rendered);
+        }
+    }
+    pthread_mutex_unlock(&m_mx);
+    if (!have) memset(block, 0, sizeof(int16_t) * BLOCK);
+    return have;
 }
 
 // ---- the duplex loop: the CARD is the metronome ---------------------------------
@@ -524,16 +592,7 @@ static void *duplex_main(void *arg) {
             fprintf(stderr, "far-field-service: %s\n", st);
         }
         // render leg: one block out, reference first
-        int have = 0;
-        pthread_mutex_lock(&m_mx);
-        if (m_qn >= BLOCK) {
-            memcpy(block, m_q, sizeof block);
-            m_qn -= BLOCK;
-            memmove(m_q, m_q + BLOCK, m_qn * 2);
-            have = 1;
-        }
-        pthread_mutex_unlock(&m_mx);
-        if (!have) memset(block, 0, sizeof block);
+        int have = mouth_take_block(block);
         // the duck: ramp the gain across the block (a 12 dB step would click)
         // and scale BEFORE the canceller's reference — it must hear exactly
         // what plays, so ducking costs zero re-convergence
@@ -560,7 +619,9 @@ static void *duplex_main(void *arg) {
                 double v = clean[i] * g_gain;        // lift the CLEAN signal for VAD/ASR
                 clean[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
             }
-        tap_cast(clean, raw);
+        // Only blocks submitted to playback, after queue cancellation and ducking.
+        // The microphone/card clock, playback buffer and AEC ordering stay intact.
+        tap_cast(clean, raw, block);
         if (g_scene) scene_process(tick);            // pre-ASR acoustic map (DoA + tracks)
     }
     return NULL;
@@ -605,7 +666,12 @@ static void *client_main(void *arg) {
 
     if (hdr[1] == FF_EARS) {
         if (len) { close(fd); return NULL; }
-        tap_add(fd, w & 1, (w >> 1) & 1);
+        tap_add(fd, w & 1, (w >> 1) & 1, 0);
+        return NULL;                                 // capture thread owns it now
+    }
+    if (hdr[1] == FF_OUTPUT) {
+        if (len || w) { close(fd); return NULL; }
+        tap_add(fd, 0, 0, 1);
         return NULL;                                 // capture thread owns it now
     }
     if (hdr[1] == FF_CTRL) {                         // duck/restore frames until hangup;
@@ -630,6 +696,10 @@ static void *client_main(void *arg) {
         return NULL;
     }
     fprintf(stderr, "far-field-service: mouth connected (%d Hz)\n", in_rate);
+    pthread_mutex_lock(&m_mx);
+    m_rendered = 0;
+    mouth_resume_locked();
+    pthread_mutex_unlock(&m_mx);
 
     struct rs rs = { 0.0, (double)in_rate / RATE, 0, 0 };
     static int16_t in[4096], out[16384];             // one mouth: static is fine
@@ -637,6 +707,47 @@ static void *client_main(void *arg) {
         if (read_full(fd, hdr, sizeof hdr) != 0 || hdr[0] != LG_FRAME_MAGIC) break;
         memcpy(&len, hdr + 6, 4);
         if (hdr[1] == FF_FLUSH) { mouth_flush(); continue; }
+        if (hdr[1] == FF_HOLD || hdr[1] == FF_GRACE) {
+            // Positions are 16 kHz mouth samples, strictly increasing. Choose
+            // the first boundary still ahead of the render cursor. The sink's
+            // existing tail plays out naturally; queued PCM is retained.
+            uint32_t grace = 0;
+            if (hdr[1] == FF_GRACE) {
+                if (len < 4 || len > 4 + 8 * 256 || (len - 4) % 8) break;
+                if (read_full(fd, &grace, 4) != 0 || grace > 2 * RATE) break;
+                len -= 4;
+            } else if (!len || len > 8 * 256 || len % 8) break;
+            uint64_t marks[256];
+            if (read_full(fd, marks, len) != 0) break;
+            int ordered = 1;
+            for (size_t i = 1; i < len / 8; i++)
+                if (marks[i] <= marks[i-1]) ordered = 0;
+            if (!ordered) break;
+            pthread_mutex_lock(&m_mx);
+            mouth_hold_locked(marks, len / 8, grace);
+            pthread_mutex_unlock(&m_mx);
+            continue;
+        }
+        if (hdr[1] == FF_RESUME) {
+            if (len) break;
+            pthread_mutex_lock(&m_mx);
+            int was_held = m_held;
+            int was_pending = m_hold_requested;
+            mouth_resume_locked();
+            pthread_mutex_unlock(&m_mx);
+            if (was_held) {
+                struct timespec now;
+                clock_gettime(CLOCK_REALTIME, &now);
+                fprintf(stderr, "far-field-service: mouth resumed at %.3f\n",
+                        now.tv_sec + now.tv_nsec / 1e9);
+            } else if (was_pending) {
+                struct timespec now;
+                clock_gettime(CLOCK_REALTIME, &now);
+                fprintf(stderr, "far-field-service: mouth hold cancelled before stop at %.3f\n",
+                        now.tv_sec + now.tv_nsec / 1e9);
+            }
+            continue;
+        }
         if (hdr[1] == FF_DRAIN) {
             for (;;) {                               // queue empty, then the sink's
                 pthread_mutex_lock(&m_mx);           // ~100 ms tail (the stream runs

@@ -1,11 +1,30 @@
 # little-gemma-tools
 
-Companion tools for [little-gemma](../little-gemma). **little-gemma's core depends
+Companion tools for [little-gemma](https://github.com/cortexist/little-gemma). **little-gemma's core depends
 on nothing** — pure C/CUDA, no libraries, by design. Tools that *do* want a heavy
 dependency (ffmpeg, etc.) live here instead, so the core stays clean. The only
 coupling is the wire protocol in `proto/lg_media_proto.h`, a self-contained copy of
 little-gemma's media frame format — a one-way dependency (tools → the protocol),
 never the reverse.
+
+## v1.0 — GGUF trio classroom
+
+v1.0 publishes the GGUF-based three-participant classroom: independent listener
+decisions, incremental ASR input, clause-streamed speech, acoustic speaker
+tracking, active/passive sessions, recording and a shared dashboard. Use it with
+[little-gemma v1.0](https://github.com/cortexist/little-gemma/tree/v1.0).
+
+Start with the [setup and voice preparation guide](docs/trio-setup.md), then the
+[dashboard](docs/trio-dashboard.md), [room behavior](docs/room-sessions.md) and
+[acoustic input contract](docs/acoustic-input.md). This release requires external
+models and compatible Piper/Whisper builds; it is not an out-of-box demo bundle.
+
+Public weights: [Agent Voice](https://huggingface.co/cortexist/agent-voice) for the
+guest and [Gemma 4 decision heads](https://huggingface.co/cortexist/gemma4-decision-head)
+for E4B/12B. **Choose two other Piper voices for teacher and student**, including
+their phoneme configuration/timing and split `.enc.onnx`/`.dec.onnx` graphs.
+**Chey's voice is private, closed-weight and is not included.** Character names
+in the examples do not grant access to their original voices.
 
 ## OpenAI-style chat API
 

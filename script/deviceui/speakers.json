@@ -1,0 +1,69 @@
+{
+  "collections": {
+    "voice-trio": {
+      "display_name": "Voice trio",
+      "speakers": {
+        "catherine-byers": {
+          "display_name": "Catherine Byers",
+          "address_name": "Mrs. Byers",
+          "address_title": "Mrs.",
+          "address_name_part": "Byers",
+          "voice_id": "lessac",
+          "voice": "en_US-lessac-medium.onnx",
+          "face_color": "#f5edbd",
+          "role": "teacher"
+        },
+        "chey": {
+          "display_name": "Chey",
+          "address_name": "Chey",
+          "address_name_part": "Chey",
+          "pronunciation": "shy",
+          "voice_id": "ozgirl",
+          "voice": "en_US-chey-C-freshmatched-u27000-20260917.onnx",
+          "face_color": "#e4d7f2",
+          "role": "student"
+        },
+        "agent-smith": {
+          "display_name": "Agent Smith",
+          "address_name": "Agent Smith",
+          "address_title": "Agent",
+          "address_name_part": "Smith",
+          "voice_id": "agent-smith-joe-u24000",
+          "voice": "en_US-agent_smith-joe-u24000.onnx",
+          "face_color": "#e2ebd7",
+          "role": "guest"
+        }
+      }
+    },
+    "voice-classroom": {
+      "display_name": "Voice classroom",
+      "speakers": {
+        "catherine-byers": {
+          "display_name": "Catherine Byers",
+          "address_name": "Mrs. Byers",
+          "voice_id": "lessac",
+          "voice": "en_US-lessac-medium.onnx",
+          "face_color": "#e2ebd7",
+          "role": "teacher"
+        },
+        "linda-johnson": {
+          "display_name": "Linda Johnson",
+          "address_name": "Mrs. Johnson",
+          "voice_id": "ljspeech",
+          "voice": "en_US-ljspeech-medium.onnx",
+          "face_color": "#d5e5f5",
+          "role": "teacher"
+        },
+        "chey": {
+          "display_name": "Chey",
+          "address_name": "Chey",
+          "pronunciation": "shy",
+          "voice_id": "ozgirl",
+          "voice": "en_US-ozgirl_v6-step18500.onnx",
+          "face_color": "#e4d7f2",
+          "role": "student"
+        }
+      }
+    }
+  }
+}

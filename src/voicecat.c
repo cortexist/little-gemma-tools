@@ -191,6 +191,7 @@ static double now_sec(void) {
 // missing/slow monitor must never stall the microphone or speaker.
 static const char *g_monitor_sock = NULL, *g_control_sock = NULL;
 static int g_listen = 1;
+static int g_turn_limit = 0, g_turn_count = 0;
 static double g_endpoint_hold_until = 0; // short renewable lease; capture/ASR continue
 #ifndef _WIN32
 static int monitor_fd = -1, control_fd = -1;
@@ -232,6 +233,19 @@ static int monitor_open(void) {
 static void monitor_event(const char *kind, const char *text) { (void)kind; (void)text; }
 static int monitor_open(void) { return g_monitor_sock || g_control_sock ? -1 : 0; }
 #endif
+
+// Enforce the session budget at input admission, not in a browser/polling loop.
+static int turn_budget_available(void) {
+    return !g_turn_limit || g_turn_count < g_turn_limit;
+}
+static void input_done(const char *text) {
+    g_turn_count++;
+    monitor_event("input_done", text);
+    if (!turn_budget_available()) {
+        g_listen = 0;
+        monitor_event("listening", "0");
+    }
+}
 
 // ---- the listener (--listener) ------------------------------------------------
 // While the user is STILL SPEAKING, ask the model what it would do if the turn
@@ -1520,6 +1534,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--monitor-sock") && i + 1 < argc) g_monitor_sock = argv[++i];
         else if (!strcmp(argv[i], "--control-sock") && i + 1 < argc) g_control_sock = argv[++i];
         else if (!strcmp(argv[i], "--start-muted")) g_listen = 0;
+        else if (!strcmp(argv[i], "--turn-limit") && i + 1 < argc) {
+            char *end; long limit = strtol(argv[++i], &end, 10);
+            if (!*argv[i] || *end || limit < 1 || limit > 48) {
+                fputs("voicecat: --turn-limit must be 1–48\n", stderr); return 1;
+            }
+            g_turn_limit = (int)limit;
+        }
         else if (!strcmp(argv[i], "--settle-ms") && i + 1 < argc)     g_settle_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-utt") && i + 1 < argc)       g_max_utt = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--wordless-close") && i + 1 < argc) g_wordless = atoi(argv[++i]);
@@ -1542,7 +1563,7 @@ int main(int argc, char **argv) {
             "                [--whisper-model FILE] [--whisper-bin PATH] [--whisper-url URL]\n"
             "                [--barge-note TEXT] [--mouth-synth CMD --mouth-play CMD]\n"
             "                [--commit-ms N=2500] [--hang-ms N=700] [--max-utt N=15] [--vad-level N=400]\n"
-            "                [--monitor-sock PATH --control-sock PATH --start-muted]\n"
+            "                [--monitor-sock PATH --control-sock PATH --start-muted] [--turn-limit N=1..48]\n"
             "                [--settle-ms N=0] transcribe after N ms of quiet; endpoint is unchanged\n"
             "                [--wordless-close N=2]  N consecutive whisper passes with zero words\n"
             "               close the utterance (~N x commit-ms into music/noise, vs max-utt's\n"
@@ -1707,19 +1728,21 @@ int main(int argc, char **argv) {
         while (control_fd >= 0 && (nc = (int)recv(control_fd, command, sizeof command-1, 0)) > 0) {
             command[nc] = 0;
             if (!strcmp(command, "listen 0") || !strcmp(command, "listen 1")) {
-                g_listen = command[7] == '1'; monitor_event("listening", g_listen ? "1" : "0");
+                g_listen = command[7] == '1' && turn_budget_available();
+                monitor_event("listening", g_listen ? "1" : "0");
             } else if (!strncmp(command, "endpoint-hold ", 14)) {
                 char *end; long ms = strtol(command+14, &end, 10);
                 if (end != command+14 && !*end && ms >= 0 && ms <= 5000) {
                     g_endpoint_hold_until = now_sec() + ms/1000.0;
                 }
             } else if (!strncmp(command, "prompt ", 7)) {
-                if (in_utt || pending > 0 || mouth_speaking()) monitor_event("rejected", "pipeline busy");
+                if (!turn_budget_available()) monitor_event("rejected", "turn limit reached");
+                else if (in_utt || pending > 0 || mouth_speaking()) monitor_event("rejected", "pipeline busy");
                 else {
                     for (int j=7; j<nc; j++) if (command[j]=='\n' || command[j]=='\r') command[j]=' ';
                     command[nc++]='\n';
                     if (send_all(s, command+7, nc-7) == 0) {
-                        command[nc-1]=0; monitor_event("input_done", command+7);
+                        command[nc-1]=0; input_done(command+7);
                         pending++; dirty=1; last_rx=now_sec();
                     }
                 }
@@ -1997,7 +2020,7 @@ int main(int argc, char **argv) {
                     }
                     if (L > sizeof line - 2) L = sizeof line - 2;
                     line[L] = '\n'; line[L + 1] = 0;
-                    monitor_event("input_done", line);
+                    input_done(line);
                     send_all(s, line, L + 1);
                     pending++; barge_armed = 1; barged = 0; dirty = 1; g_last_close = now_sec();
                     fprintf(stderr, "voicecat: turn closed (%d+ words)\n", committed);
@@ -2029,6 +2052,7 @@ int main(int argc, char **argv) {
                 if (barged) { send_frame(s, LG_FRAME_TEXT, g_barge_note, (uint32_t)strlen(g_barge_note)); barged = 0; }
                 send_frame(s, LG_FRAME_AUDIO, ub, (uint32_t)((ub_n + pad) * 2));
                 send_all(s, "\n", 1);
+                input_done("[audio]");
                 pending++; barge_armed = 1; dirty = 1; g_last_close = now_sec();
                 fprintf(stderr, "voicecat: turn closed (%.1fs audio)\n", (double)ub_n / LG_RATE);
             } else {                                     // a blip, or talker-less sound:

@@ -71,6 +71,14 @@ cuts only when words materialize, and un-ducks when a door slam or cough
 comes to nothing — the reply swells back unharmed (`--duck-sock` in
 voicecat; both paths verified acoustically on the monitor).
 
+The experimental trio mouth may instead send `H` with strictly increasing
+little-endian `uint64` word-end positions in the service's 16 kHz output
+samples. The service holds at the first future boundary, retains queued PCM,
+and keeps both card streams running with silence. `R` resumes that PCM from
+the boundary. This is a reversible pause, not the `voicecat` duck. A mouth
+hangup still cancels it and flushes the queue. A compiled mouth with `H`/`R`
+support is required before enabling this trio option.
+
 **A mouth hanging up WITHOUT draining is the cut.** Everything it queued is
 dropped and the sound stops within the sink's ~100 ms tail. This is not an
 edge case, it is the barge-in contract: voicecat kills its speak client and

@@ -1,0 +1,39 @@
+{
+  "collections": {
+    "voice-trio": {
+      "display_name": "Voice trio",
+      "speakers": {
+        "catherine-byers": {
+          "display_name": "Catherine Byers",
+          "address_name": "Mrs. Byers",
+          "address_title": "Mrs.",
+          "address_name_part": "Byers",
+          "voice_id": "teacher",
+          "voice": "teacher.onnx",
+          "face_color": "#f5edbd",
+          "role": "teacher"
+        },
+        "chey": {
+          "display_name": "Chey",
+          "address_name": "Chey",
+          "address_name_part": "Chey",
+          "pronunciation": "shy",
+          "voice_id": "student",
+          "voice": "student.onnx",
+          "face_color": "#e4d7f2",
+          "role": "student"
+        },
+        "agent-smith": {
+          "display_name": "Agent Smith",
+          "address_name": "Agent Smith",
+          "address_title": "Agent",
+          "address_name_part": "Smith",
+          "voice_id": "agent-voice",
+          "voice": "en_US-agent-voice.onnx",
+          "face_color": "#e2ebd7",
+          "role": "guest"
+        }
+      }
+    }
+  }
+}
